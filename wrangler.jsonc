@@ -5,9 +5,8 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "memory-mcp",
-	"main": "src/index.ts",
+	"main": "src/worker.ts",
 	"compatibility_date": "2025-03-10",
-	"compatibility_flags": ["nodejs_compat"],
 	"observability": {
 		"enabled": true
 	}
