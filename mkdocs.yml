@@ -1,0 +1,17 @@
+site_name: Local Brain MCP
+site_description: Local SQLite-backed memory MCP server
+site_dir: site
+
+docs_dir: docs
+
+nav:
+  - Home: index.md
+  - Setup: setup.md
+  - Running: running.md
+  - Client Configuration: client-config.md
+  - API Reference: api.md
+  - Internals: internals.md
+
+theme:
+  name: material
+
