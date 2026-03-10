@@ -10,15 +10,57 @@ from fastmcp import FastMCP
 from openai import OpenAI
 
 
+def _load_cursor_mcp_env() -> dict:
+	"""
+	Load environment overrides from the local Cursor MCP config (mcp.json), if present.
+
+	This lets a locally-run MCP server pick up the same env configuration that
+	Cursor uses, without requiring you to manually export variables each time.
+	"""
+	try:
+		config_path = Path.home() / ".cursor" / "mcp.json"
+		if not config_path.is_file():
+			return {}
+
+		with config_path.open("r", encoding="utf-8") as f:
+			raw = json.load(f)
+	except Exception:
+		return {}
+
+	try:
+		servers = raw.get("mcpServers", {})
+		local_brain = servers.get("local-brain-mcp", {})
+		env_cfg = local_brain.get("env", {}) or {}
+		# Only allow simple string key/values.
+		return {str(k): str(v) for k, v in env_cfg.items()}
+	except Exception:
+		return {}
+
+
+_CURSOR_ENV = _load_cursor_mcp_env()
+
+
+def _get_env(key: str, default: Optional[str] = None) -> Optional[str]:
+	"""
+	Helper to read environment variables with a fallback to the local
+	Cursor MCP config (mcp.json) when running locally.
+	"""
+	if key in os.environ:
+		return os.environ[key]
+	if key in _CURSOR_ENV:
+		return _CURSOR_ENV[key]
+	return default
+
+
 DEFAULT_DB_URL = (
-	os.environ.get("dbUrl")
-	or os.environ.get("DB_URL")
-	or os.environ.get("MEMORY_DB_URL")
+	_get_env("dbUrl")
+	or _get_env("DB_URL")
+	or _get_env("MEMORY_DB_URL")
 	or "memory.db"
 )
 
-EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "openai")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_PROVIDER = _get_env("EMBEDDING_PROVIDER", "openai")
+EMBEDDING_MODEL = _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -41,8 +83,15 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
 """
 
 
-def _resolve_db_path(db_url: Optional[str]) -> Path:
-	raw = db_url or DEFAULT_DB_URL
+def _resolve_db_path(_db_url: Optional[str]) -> Path:
+	"""
+	Resolve the database path.
+
+	Note: The effective DB path is always derived from environment variables
+	(via DEFAULT_DB_URL). The dbUrl tool argument is intentionally ignored so
+	that all clients share the same configured database.
+	"""
+	raw = DEFAULT_DB_URL
 
 	if raw.startswith("file:"):
 		from urllib.parse import urlparse
@@ -74,7 +123,7 @@ def _embed_text(text: str) -> Optional[List[float]]:
 	- "openrouter": uses OPENROUTER_API_KEY and OpenRouter HTTP API
 	"""
 	if EMBEDDING_PROVIDER == "openrouter":
-		api_key = os.environ.get("OPENROUTER_API_KEY")
+		api_key = _get_env("OPENROUTER_API_KEY")
 		if not api_key:
 			return None
 
@@ -103,7 +152,7 @@ def _embed_text(text: str) -> Optional[List[float]]:
 			return data["data"][0]["embedding"]
 
 	# Default: OpenAI embeddings
-	api_key = os.environ.get("OPENAI_API_KEY")
+	api_key = _get_env("OPENAI_API_KEY")
 	if not api_key:
 		return None
 

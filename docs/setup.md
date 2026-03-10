@@ -1,5 +1,7 @@
 # Setup
 
+This guide prepares your environment so you can **run the MCP server locally** on your machine.
+
 ## Requirements
 
 - Python 3.10+
