@@ -2,7 +2,7 @@
 
 ## Cursor (HTTP MCP)
 
-To use this server from Cursor (or any MCP client that supports HTTP transport), point the MCP configuration at the local HTTP endpoint:
+Because the server runs **locally** on your machine, Cursor connects to it at `http://localhost:3000/mcp`. Point your MCP configuration at that endpoint:
 
 ```json
 "local-brain-mcp": {

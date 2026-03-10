@@ -1,9 +1,9 @@
 Local Brain MCP
 ===============
 
-Local Brain MCP is a small MCP server that lets AI assistants store and retrieve personal memories on your own disk, and optionally use **semantic (embedding) search** for RAG‑style workflows.
+Local Brain MCP is a small MCP server that you **run locally** on your machine. It lets AI assistants store and retrieve personal memories on your own disk, and optionally use **semantic (embedding) search** for RAG‑style workflows.
 
-It is designed to be run locally (or behind something like Cloudflare Tunnel) and accessed by MCP‑aware clients such as Cursor.
+You run the server on your computer (e.g. `python server.py`); Cursor and other MCP clients connect to it at `http://localhost:3000/mcp`. Optionally, you can expose it via something like Cloudflare Tunnel to use the same memory from other devices.
 
 ## Features
 
