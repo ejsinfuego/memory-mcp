@@ -311,16 +311,17 @@ def fetch_memories(
 	query: str,
 	limit: int = 10,
 	dbUrl: Optional[str] = None,
-	use_vector_search: bool = False,
+	use_vector_search: bool = True,
 ) -> List[dict]:
 	"""
-	Search memories by text query. Results are ordered by recency (keyword mode)
-	or semantic similarity (vector mode).
+	Search memories by text query (RAG-style retrieval). By default uses
+	embedding-based semantic similarity; falls back to keyword search if
+	embeddings are not configured or unavailable.
 
-	- query: text to search for
-	- limit: maximum number of results to return (default 10, max 50)
+	- query: text to search for (semantic match when use_vector_search is True).
+	- limit: maximum number of results to return (default 10, max 50).
 	- dbUrl: optional database URL or path (file: URL or filesystem path).
-	- use_vector_search: if True, use embedding-based similarity (requires OPENAI_API_KEY).
+	- use_vector_search: if True (default), use RAG/semantic retrieval; if False, keyword-only.
 	"""
 	if limit <= 0:
 		raise ValueError("limit must be positive")
@@ -356,6 +357,50 @@ def fetch_memories(
 		)
 
 	return results
+
+
+def backfill_embeddings(db_url: Optional[str] = None) -> dict:
+	"""
+	Generate and store embeddings for all memories that don't have one.
+	Requires an embedding API to be configured (e.g. OPENAI_API_KEY).
+	Returns a dict with backfilled, failed, and total_without counts.
+	"""
+	conn = _get_connection(db_url)
+	try:
+		cursor = conn.execute(
+			"""
+			SELECT m.id, m.content
+			FROM memories m
+			LEFT JOIN memory_embeddings e ON m.id = e.memory_id
+			WHERE e.memory_id IS NULL
+			ORDER BY m.id
+			"""
+		)
+		rows = cursor.fetchall()
+		created = 0
+		failed = 0
+		for row in rows:
+			memory_id, content = row["id"], row["content"]
+			try:
+				vec = _embed_text(content)
+				if vec is None:
+					failed += 1
+					continue
+				conn.execute(
+					"INSERT OR REPLACE INTO memory_embeddings (memory_id, model, embedding) VALUES (?, ?, ?)",
+					(memory_id, EMBEDDING_MODEL, json.dumps(vec)),
+				)
+				created += 1
+			except Exception:
+				failed += 1
+		conn.commit()
+		return {
+			"backfilled": created,
+			"failed": failed,
+			"total_without": len(rows),
+		}
+	finally:
+		conn.close()
 
 
 if __name__ == "__main__":

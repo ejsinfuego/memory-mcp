@@ -12,10 +12,10 @@ alwaysApply: true
   - `save_memory` requires a non‑empty `content` string; calls without it are invalid.
   - `title`, `tags`, and `source` are optional but recommended to make later search more useful.
 
-- **Embeddings and vector search**
+- **Embeddings and vector search (RAG)**
   - Embeddings are optional; they are generated when `generate_embedding` is `true` and a provider is configured.
   - Provider is selected via `EMBEDDING_PROVIDER` (`openai` or `openrouter`) and `EMBEDDING_MODEL`, plus the appropriate API key (`OPENAI_API_KEY` or `OPENROUTER_API_KEY`).
-  - Use `fetch_memories` with `use_vector_search=true` for semantic retrieval; it will fall back to keyword search if embeddings are unavailable.
+  - `fetch_memories` uses RAG by default (semantic retrieval); it falls back to keyword search if embeddings are unavailable. Use `use_vector_search=false` only when you want keyword-only search.
 
 - **Cross‑project behavior**
   - Multiple Cursor projects can safely share the same memory store as long as they point at the same MCP endpoint.

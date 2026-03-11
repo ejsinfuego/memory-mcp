@@ -1,4 +1,4 @@
-# Local Brain MCP
+# [Local Brain MCP](https://github.com/ejsinfuego/memory-mcp)
 
 Local Brain MCP is a small MCP server that you **run locally** on your machine. It stores and retrieves your personal memories in a local SQLite database and is intended to be accessed over HTTP by MCP‑aware clients such as Cursor (e.g. at `http://localhost:3000/mcp`).
 
@@ -15,5 +15,5 @@ Local Brain MCP is a small MCP server that you **run locally** on your machine. 
 - **Storage**: SQLite database file (`memory.db` by default).
 - **Tools**:
   - `save_memory` — insert a memory row.
-  - `fetch_memories` — search memories by text.
+  - `fetch_memories` — RAG-style search (semantic by default, keyword fallback).
 
