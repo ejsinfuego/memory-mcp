@@ -49,7 +49,7 @@ JSON object with:
 
 ## `fetch_memories`
 
-Search memories by text in `content` or `title`, ordered by recency.
+RAG-style retrieval: search memories by semantic similarity (default) or by keyword. Results are ordered by relevance (vector mode) or recency (keyword mode).
 
 ### Signature (Python)
 
@@ -59,21 +59,21 @@ def fetch_memories(
     query: str,
     limit: int = 10,
     dbUrl: Optional[str] = None,
+    use_vector_search: bool = True,
 ) -> List[dict]:
     ...
 ```
 
 ### Parameters
 
-- `query` (string, required): substring to match in `content` or `title`.
+- `query` (string, required): text to search for (semantic match when RAG/vector search is used).
 - `limit` (int, optional): max results (default `10`, max `50`).
 - `dbUrl` (string, optional): database path or `file:` URL; overrides env/default.
+- `use_vector_search` (bool, optional, default `True`): if `True`, use RAG (embedding-based similarity); falls back to keyword search if embeddings unavailable. If `False`, keyword-only (`LIKE` on `content`/`title`).
 
 ### Behavior
 
-- Performs `LIKE` matches on `content` and `title`.
-- Orders results by `datetime(created_at) DESC, id DESC`.
-- Returns a list of objects:
-
-  - `id`, `created_at`, `title`, `content`, `tags` (parsed list), `source`.
+- **Default (RAG)**: Embeds the query, compares to stored embeddings, returns memories ranked by cosine similarity; falls back to keyword search if no embeddings.
+- **Keyword-only** (`use_vector_search=False`): `LIKE` on `content` and `title`, ordered by recency.
+- Returns a list of objects: `id`, `created_at`, `title`, `content`, `tags` (parsed list), `source`.
 
