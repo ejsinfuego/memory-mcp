@@ -13,7 +13,7 @@ Resolves a `dbUrl` argument or environment setting into an absolute `Path`.
 
 ### `_get_connection(db_url: Optional[str]) -> sqlite3.Connection`
 
-Opens a SQLite connection to the resolved path, sets `row_factory` to `sqlite3.Row`, and ensures the `memories` table exists by running `CREATE TABLE IF NOT EXISTS`.
+Opens a SQLite connection to the resolved path, sets `row_factory` to `sqlite3.Row`, runs `PRAGMA foreign_keys = ON` (so `memory_embeddings` rows cascade on memory delete), and ensures the `memories` and `memory_embeddings` tables exist via `CREATE TABLE IF NOT EXISTS`.
 
 ## MCP server
 
@@ -22,7 +22,7 @@ from fastmcp import FastMCP
 
 mcp = FastMCP("Local Brain MCP")
 
-# tools: save_memory, fetch_memories
+# tools: save_memory, update_memory, delete_memory, fetch_memories, backfill_all_embeddings
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=3000)
