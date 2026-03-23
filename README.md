@@ -147,6 +147,8 @@ Parameters:
   - `True` (default): embed the query and return memories ranked by semantic similarity; falls back to keyword search if embeddings are unavailable.
   - `False`: keyword-only — SQL `LIKE` on `content` and `title`, ordered by recency.
 - `fields` (list of str, optional): if set, each result includes only these keys. Allowed: `id`, `created_at`, `title`, `content`, `tags`, `source`. Omit for all fields. Useful to shrink MCP tool payloads (e.g. exclude `content` when listing or probing).
+- `tags_any` (list of str, optional): if set, return only rows containing at least one of the provided tags (case-insensitive).
+- `source_prefix` (str, optional): if set, return only rows where `source` starts with this prefix.
 
 Returns:
 

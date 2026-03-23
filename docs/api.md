@@ -107,6 +107,8 @@ def fetch_memories(
     dbUrl: Optional[str] = None,
     use_vector_search: bool = True,
     fields: Optional[List[str]] = None,
+    tags_any: Optional[List[str]] = None,
+    source_prefix: Optional[str] = None,
 ) -> List[dict]:
     ...
 ```
@@ -118,9 +120,12 @@ def fetch_memories(
 - `dbUrl` (string, optional): ignored for path resolution; DB comes from env.
 - `use_vector_search` (bool, optional, default `True`): if `True`, use RAG (embedding-based similarity); falls back to keyword search if embeddings unavailable. If `False`, keyword-only (`LIKE` on `content`/`title`).
 - `fields` (list of strings, optional): if set, each result includes only these keys: `id`, `created_at`, `title`, `content`, `tags`, `source`. Omit for all fields.
+- `tags_any` (list of strings, optional): return only rows that contain at least one of these tags (case-insensitive match).
+- `source_prefix` (string, optional): return only rows whose `source` starts with this prefix.
 
 ### Behavior
 
 - **Default (RAG)**: Embeds the query, compares to stored embeddings, returns memories ranked by cosine similarity; falls back to keyword search if no embeddings.
 - **Keyword-only** (`use_vector_search=False`): `LIKE` on `content` and `title`, ordered by recency.
+- **Filters**: `tags_any` and `source_prefix` apply to recent, keyword, and vector retrieval paths.
 - Returns a list of objects; keys depend on `fields` (default: `id`, `created_at`, `title`, `content`, `tags` as a parsed list, `source`).

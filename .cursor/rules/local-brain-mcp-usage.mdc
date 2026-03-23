@@ -32,6 +32,7 @@ alwaysApply: true
 - **`fetch_memories` — token‑conscious usage**
   - Default `limit` is **5** (max 50). Prefer the **smallest** `limit` that still answers the question (e.g. 3 for a narrow check); raise it only when you need broader context.
   - Optional **`fields`**: pass a subset of `id`, `created_at`, `title`, `content`, `tags`, `source` to return only those keys per row. Omit `content` when you only need ids/titles/metadata, then fetch full rows in a follow‑up if needed.
+  - Optional **`tags_any`** and **`source_prefix`**: apply them whenever possible to narrow recall before answer generation and reduce irrelevant context.
   - For tasks that depend on prior project decisions or stored facts, call `fetch_memories` **early** with a short `query` (or blank for recent history) instead of re‑deriving everything from chat.
 
 - **Cross‑project behavior**
