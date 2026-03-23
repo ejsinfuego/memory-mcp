@@ -3,7 +3,7 @@ import math
 import os
 import sqlite3
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import httpx
 from fastmcp import FastMCP
@@ -192,7 +192,11 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 
 def _search_memories_keyword(
-	conn: sqlite3.Connection, query: str, limit: int
+	conn: sqlite3.Connection,
+	query: str,
+	limit: int,
+	tags_any: Optional[Set[str]] = None,
+	source_prefix: Optional[str] = None,
 ) -> List[sqlite3.Row]:
 	cursor = conn.execute(
 		"""
@@ -200,14 +204,19 @@ def _search_memories_keyword(
     FROM memories
     WHERE content LIKE ? OR IFNULL(title, '') LIKE ?
     ORDER BY datetime(created_at) DESC, id DESC
-    LIMIT ?
     """,
-		(f"%{query}%", f"%{query}%", limit),
+		(f"%{query}%", f"%{query}%"),
 	)
-	return cursor.fetchall()
+	rows = cursor.fetchall()
+	return _apply_memory_filters(rows, limit, tags_any, source_prefix)
 
 
-def _fetch_latest_memories(conn: sqlite3.Connection, limit: int) -> List[sqlite3.Row]:
+def _fetch_latest_memories(
+	conn: sqlite3.Connection,
+	limit: int,
+	tags_any: Optional[Set[str]] = None,
+	source_prefix: Optional[str] = None,
+) -> List[sqlite3.Row]:
 	"""
 	Return the most recently created memories, newest first.
 	"""
@@ -216,27 +225,40 @@ def _fetch_latest_memories(conn: sqlite3.Connection, limit: int) -> List[sqlite3
     SELECT id, created_at, title, content, tags, source
     FROM memories
     ORDER BY datetime(created_at) DESC, id DESC
-    LIMIT ?
     """,
-		(limit,),
+		(),
 	)
-	return cursor.fetchall()
+	rows = cursor.fetchall()
+	return _apply_memory_filters(rows, limit, tags_any, source_prefix)
 
 
 def _search_memories_vector(
-	conn: sqlite3.Connection, query: str, limit: int
+	conn: sqlite3.Connection,
+	query: str,
+	limit: int,
+	tags_any: Optional[Set[str]] = None,
+	source_prefix: Optional[str] = None,
 ) -> List[sqlite3.Row]:
 	query_embedding = _embed_text(query)
 	if query_embedding is None:
 		# Fallback to keyword search if embeddings are not configured.
-		return _search_memories_keyword(conn, query, limit)
+		return _search_memories_keyword(conn, query, limit, tags_any, source_prefix)
 
 	# Load all embeddings for this model.
 	cursor = conn.execute(
 		"""
-    SELECT memory_id, embedding
-    FROM memory_embeddings
-    WHERE model = ?
+    SELECT
+      e.memory_id,
+      e.embedding,
+      m.id,
+      m.created_at,
+      m.title,
+      m.content,
+      m.tags,
+      m.source
+    FROM memory_embeddings e
+    JOIN memories m ON m.id = e.memory_id
+    WHERE e.model = ?
     """,
 		(EMBEDDING_MODEL,),
 	)
@@ -245,17 +267,21 @@ def _search_memories_vector(
 	if not rows:
 		# If we have no stored embeddings yet, fall back to keyword search
 		# rather than returning an empty result set.
-		return _search_memories_keyword(conn, query, limit)
+		return _search_memories_keyword(conn, query, limit, tags_any, source_prefix)
 
 	# Compute cosine similarity in Python.
 	scores: List[Tuple[int, float]] = []
+	id_to_row: dict[int, sqlite3.Row] = {}
 	for row in rows:
+		if not _row_matches_filters(row, tags_any, source_prefix):
+			continue
 		try:
 			vec = json.loads(row["embedding"])
 			score = _cosine_similarity(query_embedding, vec)
 		except Exception:
 			continue
 		scores.append((row["memory_id"], score))
+		id_to_row[row["memory_id"]] = row
 
 	# Sort by similarity descending and take top N ids.
 	scores.sort(key=lambda item: item[1], reverse=True)
@@ -263,22 +289,69 @@ def _search_memories_vector(
 
 	if not top_ids:
 		return []
+	return [id_to_row[memory_id] for memory_id in top_ids if memory_id in id_to_row]
 
-	placeholders = ",".join("?" for _ in top_ids)
-	cursor = conn.execute(
-		f"""
-    SELECT id, created_at, title, content, tags, source
-    FROM memories
-    WHERE id IN ({placeholders})
-    """,
-		top_ids,
-	)
-	memory_rows = cursor.fetchall()
 
-	# Preserve the ranking order from top_ids.
-	order = {memory_id: idx for idx, memory_id in enumerate(top_ids)}
-	memory_rows.sort(key=lambda r: order.get(r["id"], len(order)))
-	return memory_rows
+def _normalize_tag_filter(tags_any: Optional[List[str]]) -> Optional[Set[str]]:
+	if tags_any is None:
+		return None
+	names = {str(t).strip().lower() for t in tags_any if str(t).strip()}
+	if not names:
+		raise ValueError("tags_any, if provided, must include at least one non-empty tag")
+	return names
+
+
+def _normalize_source_prefix(source_prefix: Optional[str]) -> Optional[str]:
+	if source_prefix is None:
+		return None
+	value = str(source_prefix).strip()
+	if not value:
+		raise ValueError(
+			"source_prefix, if provided, must contain at least one non-whitespace character"
+		)
+	return value
+
+
+def _row_matches_filters(
+	row: sqlite3.Row, tags_any: Optional[Set[str]], source_prefix: Optional[str]
+) -> bool:
+	if source_prefix is not None:
+		source = row["source"] or ""
+		if not str(source).startswith(source_prefix):
+			return False
+
+	if tags_any is not None:
+		raw_tags = row["tags"]
+		try:
+			stored_tags = json.loads(raw_tags) if raw_tags else []
+		except json.JSONDecodeError:
+			stored_tags = []
+		stored_tag_set = {
+			str(tag).strip().lower()
+			for tag in stored_tags
+			if isinstance(tag, str) and str(tag).strip()
+		}
+		if not (stored_tag_set & tags_any):
+			return False
+
+	return True
+
+
+def _apply_memory_filters(
+	rows: List[sqlite3.Row],
+	limit: int,
+	tags_any: Optional[Set[str]],
+	source_prefix: Optional[str],
+) -> List[sqlite3.Row]:
+	if tags_any is None and source_prefix is None:
+		return rows[:limit]
+	matched: List[sqlite3.Row] = []
+	for row in rows:
+		if _row_matches_filters(row, tags_any, source_prefix):
+			matched.append(row)
+			if len(matched) >= limit:
+				break
+	return matched
 
 
 _FETCH_MEMORY_FIELD_NAMES = frozenset(
@@ -494,6 +567,8 @@ def fetch_memories(
 	dbUrl: Optional[str] = None,
 	use_vector_search: bool = True,
 	fields: Optional[List[str]] = None,
+	tags_any: Optional[List[str]] = None,
+	source_prefix: Optional[str] = None,
 ) -> List[dict]:
 	"""
 	Search memories by text query (RAG-style retrieval). By default uses
@@ -507,6 +582,8 @@ def fetch_memories(
 	- use_vector_search: if True (default), use RAG/semantic retrieval; if False, keyword-only.
 	- fields: optional subset of keys to return per row: id, created_at, title, content, tags, source.
 	  Omit or pass null for all fields. Requesting fewer fields (e.g. without content) reduces tool payload size.
+	- tags_any: optional list of tags; when provided, return only rows that contain at least one of these tags.
+	- source_prefix: optional source prefix; when provided, return only rows where source starts with this prefix.
 	"""
 	if limit <= 0:
 		raise ValueError("limit must be positive")
@@ -514,16 +591,20 @@ def fetch_memories(
 		limit = 50
 
 	field_set = _normalize_fetch_fields(fields)
+	tag_filter = _normalize_tag_filter(tags_any)
+	source_filter = _normalize_source_prefix(source_prefix)
 
 	conn = _get_connection(dbUrl)
 	try:
 		# If no query is provided, return the latest memories instead of erroring.
 		if query is None or not str(query).strip():
-			rows = _fetch_latest_memories(conn, limit)
+			rows = _fetch_latest_memories(conn, limit, tag_filter, source_filter)
 		elif use_vector_search:
-			rows = _search_memories_vector(conn, query, limit)
+			rows = _search_memories_vector(
+				conn, query, limit, tag_filter, source_filter
+			)
 		else:
-			rows = _search_memories_keyword(conn, query, limit)
+			rows = _search_memories_keyword(conn, query, limit, tag_filter, source_filter)
 	finally:
 		conn.close()
 
