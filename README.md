@@ -13,6 +13,8 @@ You run the server on your computer (e.g. `python server.py`); Cursor and other 
 
 - **MCP tools**
   - `save_memory` — insert a memory row (optionally generating an embedding).
+  - `update_memory` — patch `title` / `content` / `tags` / `source` on an existing row; optional embedding refresh when `content` changes.
+  - `delete_memory` — remove a row by id (embeddings removed with it).
   - `fetch_memories` — RAG-style retrieval: by default uses semantic vector search over embeddings; falls back to keyword search if embeddings are unavailable.
 
 - **Embeddings / vector search**
@@ -110,22 +112,47 @@ Returns:
 
 - A dict with `id`, `title`, `content`, `tags`, `source`.
 
-### `fetch_memories`
+### `update_memory`
 
-**Purpose**: Retrieve memories relevant to a query.
+**Purpose**: Update fields on an existing memory (omit fields you do not want to change).
 
 Parameters:
 
-- `query` (str, required): text query.
-- `limit` (int, optional, default `10`, max `50`): max number of results.
+- `memory_id` (int, required): id of the row to update.
+- `title`, `content`, `tags`, `source` (optional): new values; at least one must be provided.
+- `generate_embedding` (bool, default `True`): when `content` changes, if `True` recompute the embedding; if `False`, drop the stored embedding so vector search cannot use stale vectors.
+
+Returns: dict with `id`, `title`, `content`, `tags`, `source`.
+
+### `delete_memory`
+
+**Purpose**: Delete a memory by id.
+
+Parameters:
+
+- `memory_id` (int, required).
+
+Returns: `{ "id": <int>, "deleted": <bool> }` (`deleted` is `False` if no row existed).
+
+### `fetch_memories`
+
+**Purpose**: Retrieve memories relevant to a query, or the most recent rows when the query is empty.
+
+Parameters:
+
+- `query` (str, optional): text query; if omitted or blank (or whitespace-only), returns the latest memories (recent-first)—a “list recent” behavior, not search.
+- `limit` (int, optional, default `5`, max `50`): max number of results.
 - `dbUrl` (str, optional): override database path/URL.
 - `use_vector_search` (bool, optional, default `True`): RAG-style retrieval.
   - `True` (default): embed the query and return memories ranked by semantic similarity; falls back to keyword search if embeddings are unavailable.
   - `False`: keyword-only — SQL `LIKE` on `content` and `title`, ordered by recency.
+- `fields` (list of str, optional): if set, each result includes only these keys. Allowed: `id`, `created_at`, `title`, `content`, `tags`, `source`. Omit for all fields. Useful to shrink MCP tool payloads (e.g. exclude `content` when listing or probing).
+- `tags_any` (list of str, optional): if set, return only rows containing at least one of the provided tags (case-insensitive).
+- `source_prefix` (str, optional): if set, return only rows where `source` starts with this prefix.
 
 Returns:
 
-- A list of dicts with `id`, `created_at`, `title`, `content`, `tags`, `source`.
+- A list of dicts; by default each includes `id`, `created_at`, `title`, `content`, `tags`, `source`. With `fields`, only the requested keys are present.
 
 ## Using this as a RAG memory
 
@@ -142,6 +169,9 @@ Typical pattern for an AI assistant:
 
 3. **Fallback behavior**  
    If embeddings are not configured or not yet stored, vector search cleanly degrades to keyword search, so the tools remain usable.
+
+4. **Hygiene**  
+   Use `update_memory` to correct a row without duplicating it; use `delete_memory` to drop obsolete entries.
 
 ## Development notes
 

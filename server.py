@@ -3,7 +3,7 @@ import math
 import os
 import sqlite3
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import httpx
 from fastmcp import FastMCP
@@ -109,9 +109,18 @@ def _get_connection(db_url: Optional[str]) -> sqlite3.Connection:
 	path = _resolve_db_path(db_url)
 	conn = sqlite3.connect(path)
 	conn.row_factory = sqlite3.Row
+	conn.execute("PRAGMA foreign_keys = ON")
 	conn.execute(CREATE_TABLE_SQL)
 	conn.execute(CREATE_EMBEDDINGS_SQL)
 	return conn
+
+
+def _get_memory_row(conn: sqlite3.Connection, memory_id: int) -> Optional[sqlite3.Row]:
+	cur = conn.execute(
+		"SELECT id, created_at, title, content, tags, source FROM memories WHERE id = ?",
+		(memory_id,),
+	)
+	return cur.fetchone()
 
 
 def _embed_text(text: str) -> Optional[List[float]]:
@@ -141,24 +150,34 @@ def _embed_text(text: str) -> Optional[List[float]]:
 		if app_name:
 			headers["X-Title"] = app_name
 
-		with httpx.Client(timeout=20.0) as client:
-			resp = client.post(
-				"https://openrouter.ai/api/v1/embeddings",
-				headers=headers,
-				json={"model": model, "input": text},
-			)
-			resp.raise_for_status()
-			data = resp.json()
-			return data["data"][0]["embedding"]
+		try:
+			with httpx.Client(timeout=20.0) as client:
+				resp = client.post(
+					"https://openrouter.ai/api/v1/embeddings",
+					headers=headers,
+					json={"model": model, "input": text},
+				)
+				resp.raise_for_status()
+				data = resp.json()
+				return data["data"][0]["embedding"]
+		except Exception:
+			# Any networking/SSL or API error disables embeddings for this call,
+			# and the caller will transparently fall back to keyword search.
+			return None
 
 	# Default: OpenAI embeddings
 	api_key = _get_env("OPENAI_API_KEY")
 	if not api_key:
 		return None
 
-	client = OpenAI(api_key=api_key)
-	resp = client.embeddings.create(model=EMBEDDING_MODEL, input=text)
-	return resp.data[0].embedding
+	try:
+		client = OpenAI(api_key=api_key)
+		resp = client.embeddings.create(model=EMBEDDING_MODEL, input=text)
+		return resp.data[0].embedding
+	except Exception:
+		# Any networking/SSL or API error disables embeddings for this call,
+		# and the caller will transparently fall back to keyword search.
+		return None
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
@@ -173,7 +192,11 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 
 def _search_memories_keyword(
-	conn: sqlite3.Connection, query: str, limit: int
+	conn: sqlite3.Connection,
+	query: str,
+	limit: int,
+	tags_any: Optional[Set[str]] = None,
+	source_prefix: Optional[str] = None,
 ) -> List[sqlite3.Row]:
 	cursor = conn.execute(
 		"""
@@ -181,44 +204,84 @@ def _search_memories_keyword(
     FROM memories
     WHERE content LIKE ? OR IFNULL(title, '') LIKE ?
     ORDER BY datetime(created_at) DESC, id DESC
-    LIMIT ?
     """,
-		(f"%{query}%", f"%{query}%", limit),
+		(f"%{query}%", f"%{query}%"),
 	)
-	return cursor.fetchall()
+	rows = cursor.fetchall()
+	return _apply_memory_filters(rows, limit, tags_any, source_prefix)
+
+
+def _fetch_latest_memories(
+	conn: sqlite3.Connection,
+	limit: int,
+	tags_any: Optional[Set[str]] = None,
+	source_prefix: Optional[str] = None,
+) -> List[sqlite3.Row]:
+	"""
+	Return the most recently created memories, newest first.
+	"""
+	cursor = conn.execute(
+		"""
+    SELECT id, created_at, title, content, tags, source
+    FROM memories
+    ORDER BY datetime(created_at) DESC, id DESC
+    """,
+		(),
+	)
+	rows = cursor.fetchall()
+	return _apply_memory_filters(rows, limit, tags_any, source_prefix)
 
 
 def _search_memories_vector(
-	conn: sqlite3.Connection, query: str, limit: int
+	conn: sqlite3.Connection,
+	query: str,
+	limit: int,
+	tags_any: Optional[Set[str]] = None,
+	source_prefix: Optional[str] = None,
 ) -> List[sqlite3.Row]:
 	query_embedding = _embed_text(query)
 	if query_embedding is None:
 		# Fallback to keyword search if embeddings are not configured.
-		return _search_memories_keyword(conn, query, limit)
+		return _search_memories_keyword(conn, query, limit, tags_any, source_prefix)
 
 	# Load all embeddings for this model.
 	cursor = conn.execute(
 		"""
-    SELECT memory_id, embedding
-    FROM memory_embeddings
-    WHERE model = ?
+    SELECT
+      e.memory_id,
+      e.embedding,
+      m.id,
+      m.created_at,
+      m.title,
+      m.content,
+      m.tags,
+      m.source
+    FROM memory_embeddings e
+    JOIN memories m ON m.id = e.memory_id
+    WHERE e.model = ?
     """,
 		(EMBEDDING_MODEL,),
 	)
 	rows = cursor.fetchall()
 
 	if not rows:
-		return []
+		# If we have no stored embeddings yet, fall back to keyword search
+		# rather than returning an empty result set.
+		return _search_memories_keyword(conn, query, limit, tags_any, source_prefix)
 
 	# Compute cosine similarity in Python.
 	scores: List[Tuple[int, float]] = []
+	id_to_row: dict[int, sqlite3.Row] = {}
 	for row in rows:
+		if not _row_matches_filters(row, tags_any, source_prefix):
+			continue
 		try:
 			vec = json.loads(row["embedding"])
 			score = _cosine_similarity(query_embedding, vec)
 		except Exception:
 			continue
 		scores.append((row["memory_id"], score))
+		id_to_row[row["memory_id"]] = row
 
 	# Sort by similarity descending and take top N ids.
 	scores.sort(key=lambda item: item[1], reverse=True)
@@ -226,22 +289,104 @@ def _search_memories_vector(
 
 	if not top_ids:
 		return []
+	return [id_to_row[memory_id] for memory_id in top_ids if memory_id in id_to_row]
 
-	placeholders = ",".join("?" for _ in top_ids)
-	cursor = conn.execute(
-		f"""
-    SELECT id, created_at, title, content, tags, source
-    FROM memories
-    WHERE id IN ({placeholders})
-    """,
-		top_ids,
-	)
-	memory_rows = cursor.fetchall()
 
-	# Preserve the ranking order from top_ids.
-	order = {memory_id: idx for idx, memory_id in enumerate(top_ids)}
-	memory_rows.sort(key=lambda r: order.get(r["id"], len(order)))
-	return memory_rows
+def _normalize_tag_filter(tags_any: Optional[List[str]]) -> Optional[Set[str]]:
+	if tags_any is None:
+		return None
+	names = {str(t).strip().lower() for t in tags_any if str(t).strip()}
+	if not names:
+		raise ValueError("tags_any, if provided, must include at least one non-empty tag")
+	return names
+
+
+def _normalize_source_prefix(source_prefix: Optional[str]) -> Optional[str]:
+	if source_prefix is None:
+		return None
+	value = str(source_prefix).strip()
+	if not value:
+		raise ValueError(
+			"source_prefix, if provided, must contain at least one non-whitespace character"
+		)
+	return value
+
+
+def _row_matches_filters(
+	row: sqlite3.Row, tags_any: Optional[Set[str]], source_prefix: Optional[str]
+) -> bool:
+	if source_prefix is not None:
+		source = row["source"] or ""
+		if not str(source).startswith(source_prefix):
+			return False
+
+	if tags_any is not None:
+		raw_tags = row["tags"]
+		try:
+			stored_tags = json.loads(raw_tags) if raw_tags else []
+		except json.JSONDecodeError:
+			stored_tags = []
+		stored_tag_set = {
+			str(tag).strip().lower()
+			for tag in stored_tags
+			if isinstance(tag, str) and str(tag).strip()
+		}
+		if not (stored_tag_set & tags_any):
+			return False
+
+	return True
+
+
+def _apply_memory_filters(
+	rows: List[sqlite3.Row],
+	limit: int,
+	tags_any: Optional[Set[str]],
+	source_prefix: Optional[str],
+) -> List[sqlite3.Row]:
+	if tags_any is None and source_prefix is None:
+		return rows[:limit]
+	matched: List[sqlite3.Row] = []
+	for row in rows:
+		if _row_matches_filters(row, tags_any, source_prefix):
+			matched.append(row)
+			if len(matched) >= limit:
+				break
+	return matched
+
+
+_FETCH_MEMORY_FIELD_NAMES = frozenset(
+	{"id", "created_at", "title", "content", "tags", "source"}
+)
+
+
+def _normalize_fetch_fields(fields: Optional[List[str]]) -> Optional[frozenset]:
+	if fields is None:
+		return None
+	names = {str(f).strip() for f in fields if str(f).strip()}
+	if not names:
+		raise ValueError("fields, if provided, must include at least one field name")
+	unknown = names - _FETCH_MEMORY_FIELD_NAMES
+	if unknown:
+		raise ValueError(
+			f"unknown field(s): {sorted(unknown)}; allowed: {sorted(_FETCH_MEMORY_FIELD_NAMES)}"
+		)
+	return frozenset(names)
+
+
+def _memory_row_to_result_dict(
+	row: sqlite3.Row, parsed_tags: List[str], field_set: Optional[frozenset]
+) -> dict:
+	full = {
+		"id": row["id"],
+		"created_at": row["created_at"],
+		"title": row["title"],
+		"content": row["content"],
+		"tags": parsed_tags,
+		"source": row["source"],
+	}
+	if field_set is None:
+		return full
+	return {k: full[k] for k in full if k in field_set}
 
 
 mcp = FastMCP("Local Brain MCP")
@@ -307,11 +452,123 @@ def save_memory(
 
 
 @mcp.tool
+def update_memory(
+	memory_id: int,
+	title: Optional[str] = None,
+	content: Optional[str] = None,
+	tags: Optional[List[str]] = None,
+	source: Optional[str] = None,
+	dbUrl: Optional[str] = None,
+	generate_embedding: bool = True,
+) -> dict:
+	"""
+	Update an existing memory row. Pass only fields to change; omitted fields stay as stored.
+
+	- memory_id: row id to update.
+	- title, content, tags, source: optional replacements (at least one must be provided).
+	- generate_embedding: when `content` is updated, if True (default) recompute and store the
+	  embedding for the new text; if False, remove any stored embedding so vector search cannot
+	  return stale vectors for old text.
+	"""
+	if (
+		title is None
+		and content is None
+		and tags is None
+		and source is None
+	):
+		raise ValueError(
+			"at least one of title, content, tags, source must be provided to update_memory"
+		)
+	if content is not None and not str(content).strip():
+		raise ValueError("content, if provided, must be non-empty")
+
+	conn = _get_connection(dbUrl)
+	try:
+		row = _get_memory_row(conn, memory_id)
+		if row is None:
+			raise ValueError(f"memory not found: id={memory_id}")
+
+		prev_content = row["content"]
+		new_title = row["title"] if title is None else title
+		new_content = prev_content if content is None else content
+		new_tags_json = row["tags"] if tags is None else json.dumps(tags)
+		new_source = row["source"] if source is None else source
+
+		parsed_tags: List[str]
+		if tags is None:
+			try:
+				parsed_tags = json.loads(row["tags"]) if row["tags"] else []
+			except json.JSONDecodeError:
+				parsed_tags = []
+		else:
+			parsed_tags = tags
+
+		content_changed = new_content != prev_content
+
+		conn.execute(
+			"""
+			UPDATE memories
+			SET title = ?, content = ?, tags = ?, source = ?
+			WHERE id = ?
+			""",
+			(new_title, new_content, new_tags_json, new_source, memory_id),
+		)
+
+		if content_changed:
+			conn.execute(
+				"DELETE FROM memory_embeddings WHERE memory_id = ?",
+				(memory_id,),
+			)
+			if generate_embedding:
+				try:
+					vec = _embed_text(new_content)
+					if vec is not None:
+						conn.execute(
+							"INSERT INTO memory_embeddings (memory_id, model, embedding) VALUES (?, ?, ?)",
+							(memory_id, EMBEDDING_MODEL, json.dumps(vec)),
+						)
+				except Exception:
+					pass
+
+		conn.commit()
+	finally:
+		conn.close()
+
+	return {
+		"id": memory_id,
+		"title": new_title,
+		"content": new_content,
+		"tags": parsed_tags,
+		"source": new_source,
+	}
+
+
+@mcp.tool
+def delete_memory(memory_id: int, dbUrl: Optional[str] = None) -> dict:
+	"""
+	Delete a memory row by id. Removes any stored embedding for that row (FK cascade).
+	Returns whether a row was deleted.
+	"""
+	conn = _get_connection(dbUrl)
+	try:
+		cur = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+		conn.commit()
+		deleted = cur.rowcount > 0
+	finally:
+		conn.close()
+
+	return {"id": memory_id, "deleted": deleted}
+
+
+@mcp.tool
 def fetch_memories(
-	query: str,
-	limit: int = 10,
+	query: Optional[str] = None,
+	limit: int = 5,
 	dbUrl: Optional[str] = None,
 	use_vector_search: bool = True,
+	fields: Optional[List[str]] = None,
+	tags_any: Optional[List[str]] = None,
+	source_prefix: Optional[str] = None,
 ) -> List[dict]:
 	"""
 	Search memories by text query (RAG-style retrieval). By default uses
@@ -319,21 +576,35 @@ def fetch_memories(
 	embeddings are not configured or unavailable.
 
 	- query: text to search for (semantic match when use_vector_search is True).
-	- limit: maximum number of results to return (default 10, max 50).
+	  If omitted, null, or blank/whitespace only, returns recent memories (latest first)—same as a “list recent” view, not semantic search.
+	- limit: maximum number of results to return (default 5, max 50).
 	- dbUrl: optional database URL or path (file: URL or filesystem path).
 	- use_vector_search: if True (default), use RAG/semantic retrieval; if False, keyword-only.
+	- fields: optional subset of keys to return per row: id, created_at, title, content, tags, source.
+	  Omit or pass null for all fields. Requesting fewer fields (e.g. without content) reduces tool payload size.
+	- tags_any: optional list of tags; when provided, return only rows that contain at least one of these tags.
+	- source_prefix: optional source prefix; when provided, return only rows where source starts with this prefix.
 	"""
 	if limit <= 0:
 		raise ValueError("limit must be positive")
 	if limit > 50:
 		limit = 50
 
+	field_set = _normalize_fetch_fields(fields)
+	tag_filter = _normalize_tag_filter(tags_any)
+	source_filter = _normalize_source_prefix(source_prefix)
+
 	conn = _get_connection(dbUrl)
 	try:
-		if use_vector_search:
-			rows = _search_memories_vector(conn, query, limit)
+		# If no query is provided, return the latest memories instead of erroring.
+		if query is None or not str(query).strip():
+			rows = _fetch_latest_memories(conn, limit, tag_filter, source_filter)
+		elif use_vector_search:
+			rows = _search_memories_vector(
+				conn, query, limit, tag_filter, source_filter
+			)
 		else:
-			rows = _search_memories_keyword(conn, query, limit)
+			rows = _search_memories_keyword(conn, query, limit, tag_filter, source_filter)
 	finally:
 		conn.close()
 
@@ -345,16 +616,7 @@ def fetch_memories(
 		except json.JSONDecodeError:
 			parsed_tags = []
 
-		results.append(
-			{
-				"id": row["id"],
-				"created_at": row["created_at"],
-				"title": row["title"],
-				"content": row["content"],
-				"tags": parsed_tags,
-				"source": row["source"],
-			},
-		)
+		results.append(_memory_row_to_result_dict(row, parsed_tags, field_set))
 
 	return results
 
@@ -401,6 +663,17 @@ def backfill_embeddings(db_url: Optional[str] = None) -> dict:
 		}
 	finally:
 		conn.close()
+
+
+@mcp.tool
+def backfill_all_embeddings(dbUrl: Optional[str] = None) -> dict:
+	"""
+	Generate and store embeddings for all memories that don't have one.
+
+	Use this after configuring an embedding provider/API key so that older
+	memories become available for semantic (RAG-style) retrieval.
+	"""
+	return backfill_embeddings(dbUrl)
 
 
 if __name__ == "__main__":

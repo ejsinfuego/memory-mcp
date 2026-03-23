@@ -1,6 +1,6 @@
 # API Reference
 
-This project exposes two MCP tools: `save_memory` and `fetch_memories`.
+MCP tools: `save_memory`, `update_memory`, `delete_memory`, `fetch_memories`, and `backfill_all_embeddings`.
 
 ## `save_memory`
 
@@ -16,6 +16,7 @@ def save_memory(
     tags: Optional[List[str]] = None,
     source: Optional[str] = None,
     dbUrl: Optional[str] = None,
+    generate_embedding: bool = True,
 ) -> dict:
     ...
 ```
@@ -26,24 +27,69 @@ def save_memory(
 - `title` (string, optional): short title or label.
 - `tags` (list of strings, optional): tags for later filtering/search.
 - `source` (string, optional): where this memory came from (e.g. project name).
-- `dbUrl` (string, optional): database path or `file:` URL; overrides env/default.
-
-### Storage schema
-
-Rows are written into the `memories` table with columns:
-
-- `id` — `INTEGER PRIMARY KEY AUTOINCREMENT`
-- `created_at` — `TEXT`, default `datetime('now')`
-- `title` — `TEXT`
-- `content` — `TEXT NOT NULL`
-- `tags` — `TEXT` (JSON‑encoded list)
-- `source` — `TEXT`
+- `dbUrl` (string, optional): ignored for path resolution; DB comes from env (see server rules).
+- `generate_embedding` (bool, optional, default `True`): store an embedding when an API key is configured.
 
 ### Return
 
-JSON object with:
+JSON object with `id`, `title`, `content`, `tags`, `source`.
 
-- `id`, `title`, `content`, `tags`, `source`.
+---
+
+## `update_memory`
+
+Patch an existing memory. Omitted parameters leave the stored value unchanged. At least one of `title`, `content`, `tags`, `source` must be provided.
+
+### Signature (Python)
+
+```python
+@mcp.tool
+def update_memory(
+    memory_id: int,
+    title: Optional[str] = None,
+    content: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    source: Optional[str] = None,
+    dbUrl: Optional[str] = None,
+    generate_embedding: bool = True,
+) -> dict:
+    ...
+```
+
+### Parameters
+
+- `memory_id` (int, required): row id.
+- `title`, `content`, `tags`, `source` (optional): replacements; `content` must be non-empty if provided.
+- `generate_embedding` (bool, default `True`): when `content` changes, recompute embedding if `True`; if `False`, remove stored embedding so vector search cannot match stale text.
+
+### Errors
+
+- `ValueError` if no fields to update, if `content` is empty when provided, or if `memory_id` does not exist.
+
+### Return
+
+JSON object with `id`, `title`, `content`, `tags`, `source`.
+
+---
+
+## `delete_memory`
+
+Delete a memory row by id. Associated `memory_embeddings` rows are removed (foreign key `ON DELETE CASCADE` with `PRAGMA foreign_keys = ON`).
+
+### Signature (Python)
+
+```python
+@mcp.tool
+def delete_memory(
+    memory_id: int,
+    dbUrl: Optional[str] = None,
+) -> dict:
+    ...
+```
+
+### Return
+
+`{ "id": <int>, "deleted": <bool> }` — `deleted` is `False` if no row existed.
 
 ---
 
@@ -56,24 +102,30 @@ RAG-style retrieval: search memories by semantic similarity (default) or by keyw
 ```python
 @mcp.tool
 def fetch_memories(
-    query: str,
-    limit: int = 10,
+    query: Optional[str] = None,
+    limit: int = 5,
     dbUrl: Optional[str] = None,
     use_vector_search: bool = True,
+    fields: Optional[List[str]] = None,
+    tags_any: Optional[List[str]] = None,
+    source_prefix: Optional[str] = None,
 ) -> List[dict]:
     ...
 ```
 
 ### Parameters
 
-- `query` (string, required): text to search for (semantic match when RAG/vector search is used).
-- `limit` (int, optional): max results (default `10`, max `50`).
-- `dbUrl` (string, optional): database path or `file:` URL; overrides env/default.
+- `query` (string, optional): search text. If omitted, null, or whitespace-only, returns the most recent memories (latest first)—a “list recent” view, not search.
+- `limit` (int, optional): max results (default `5`, max `50`).
+- `dbUrl` (string, optional): ignored for path resolution; DB comes from env.
 - `use_vector_search` (bool, optional, default `True`): if `True`, use RAG (embedding-based similarity); falls back to keyword search if embeddings unavailable. If `False`, keyword-only (`LIKE` on `content`/`title`).
+- `fields` (list of strings, optional): if set, each result includes only these keys: `id`, `created_at`, `title`, `content`, `tags`, `source`. Omit for all fields.
+- `tags_any` (list of strings, optional): return only rows that contain at least one of these tags (case-insensitive match).
+- `source_prefix` (string, optional): return only rows whose `source` starts with this prefix.
 
 ### Behavior
 
 - **Default (RAG)**: Embeds the query, compares to stored embeddings, returns memories ranked by cosine similarity; falls back to keyword search if no embeddings.
 - **Keyword-only** (`use_vector_search=False`): `LIKE` on `content` and `title`, ordered by recency.
-- Returns a list of objects: `id`, `created_at`, `title`, `content`, `tags` (parsed list), `source`.
-
+- **Filters**: `tags_any` and `source_prefix` apply to recent, keyword, and vector retrieval paths.
+- Returns a list of objects; keys depend on `fields` (default: `id`, `created_at`, `title`, `content`, `tags` as a parsed list, `source`).

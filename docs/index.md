@@ -15,5 +15,7 @@ Local Brain MCP is a small MCP server that you **run locally** on your machine. 
 - **Storage**: SQLite database file (`memory.db` by default).
 - **Tools**:
   - `save_memory` — insert a memory row.
-  - `fetch_memories` — RAG-style search (semantic by default, keyword fallback).
+  - `update_memory` — patch fields on an existing row.
+  - `delete_memory` — delete a row by id.
+  - `fetch_memories` — RAG-style search (semantic by default, keyword fallback) or recent list when `query` is empty.
 

@@ -40,3 +40,4 @@ docs_build/
 
 # Logs
 *.log
+memory.db

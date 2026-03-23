@@ -9,13 +9,31 @@ alwaysApply: true
   - **Do not pass a `dbUrl` argument from tools**; assume all clients share the env‑configured DB.
 
 - **Always provide `content` to `save_memory`**
-  - `save_memory` requires a non‑empty `content` string; calls without it are invalid.
-  - `title`, `tags`, and `source` are optional but recommended to make later search more useful.
+  - `save_memory` **requires** a non‑empty `content` string; calls without it are invalid and will fail Pydantic validation.
+  - `title`, `tags`, and `source` are **optional but strongly recommended** so later search feels useful across projects.
+  - `tags` should be a **list of short strings** (e.g. `["silent-partner","campaign","bugfix"]`), not a single comma‑separated string.
+  - `source` should identify where the memory came from (e.g. `"cursor-agent"`, `"silent-partner/docs/campaigns.md"`, `"stark-hci/README"`).
+  - Avoid extremely large blobs in `content`; prefer concise summaries with links/paths to the underlying source code or docs.
+  - Do **not** send `dbUrl` from tools; the MCP server resolves the DB path from environment (see DB rules above).
+
+- **`update_memory` and `delete_memory` (hygiene)**
+  - Use **`update_memory`** to fix a row in place (pass only fields to change). If you change `content`, use `generate_embedding=true` (default) when an embedding provider is configured so RAG stays aligned; use `generate_embedding=false` only when you intentionally want to drop the vector until a later backfill.
+  - Use **`delete_memory`** to remove stale or mistaken rows; embeddings are removed with the row.
+  - `update_memory` raises if the id does not exist or if no update fields are provided; `delete_memory` returns `{ deleted: false }` when the id is missing.
 
 - **Embeddings and vector search (RAG)**
   - Embeddings are optional; they are generated when `generate_embedding` is `true` and a provider is configured.
   - Provider is selected via `EMBEDDING_PROVIDER` (`openai` or `openrouter`) and `EMBEDDING_MODEL`, plus the appropriate API key (`OPENAI_API_KEY` or `OPENROUTER_API_KEY`).
-  - `fetch_memories` uses RAG by default (semantic retrieval); it falls back to keyword search if embeddings are unavailable. Use `use_vector_search=false` only when you want keyword-only search.
+  - `fetch_memories` uses RAG by default when `use_vector_search=true`. If embeddings are unavailable or no embedding records exist yet, it automatically falls back to keyword search over `content`/`title` instead of returning no results.
+  - If `query` is omitted or blank, `fetch_memories` returns the most recent memories (latest-first) as a “recent history” view instead of performing a search.
+  - Use `backfill_all_embeddings` after configuring an embedding provider to generate embeddings for all existing memories so RAG works over historical data.
+  - Use `use_vector_search=false` when matching **exact** phrases, error strings, or known keywords in `title`/`content`; use `true` (default) for paraphrased or fuzzy intent.
+
+- **`fetch_memories` — token‑conscious usage**
+  - Default `limit` is **5** (max 50). Prefer the **smallest** `limit` that still answers the question (e.g. 3 for a narrow check); raise it only when you need broader context.
+  - Optional **`fields`**: pass a subset of `id`, `created_at`, `title`, `content`, `tags`, `source` to return only those keys per row. Omit `content` when you only need ids/titles/metadata, then fetch full rows in a follow‑up if needed.
+  - Optional **`tags_any`** and **`source_prefix`**: apply them whenever possible to narrow recall before answer generation and reduce irrelevant context.
+  - For tasks that depend on prior project decisions or stored facts, call `fetch_memories` **early** with a short `query` (or blank for recent history) instead of re‑deriving everything from chat.
 
 - **Cross‑project behavior**
   - Multiple Cursor projects can safely share the same memory store as long as they point at the same MCP endpoint.
