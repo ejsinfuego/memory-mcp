@@ -30,3 +30,11 @@ if __name__ == "__main__":
 
 FastMCP runs an HTTP MCP server listening on `0.0.0.0:3000` and serving the MCP endpoint at `/mcp`. This endpoint is what you point Cloudflare Tunnel or other HTTP MCP clients at.
 
+## Cursor env auto-load (local dev convenience)
+
+When running locally, the server attempts to load environment overrides from `~/.cursor/mcp.json`:
+
+- Looks up `mcpServers.local-brain-mcp.env`
+- Merges those key/value strings as a fallback behind real `os.environ`
+
+This makes it easy to keep DB and embedding configuration in one place for Cursor + the local server process.

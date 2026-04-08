@@ -21,7 +21,7 @@ The server stores memories in a SQLite database file.
   - `dbUrl`
   - `DB_URL`
   - `MEMORY_DB_URL`
-- **Override per call**:
-  - Pass a `dbUrl` argument (filesystem path or `file:` URL) to the tools.
 
-All paths are resolved relative to the current working directory if they are not absolute.
+The `dbUrl` *tool argument* is intentionally ignored for path resolution so all clients share the same configured DB.
+
+All (relative) DB paths are resolved relative to the server’s current working directory.

@@ -4,7 +4,7 @@ This guide prepares your environment so you can **run the MCP server locally** o
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - `fastmcp` (installed via `requirements.txt`)
 
 ## Installation
@@ -18,4 +18,3 @@ uv pip install -r requirements.txt
 ```
 
 The main MCP server entrypoint is `server.py` in the project root.
-
