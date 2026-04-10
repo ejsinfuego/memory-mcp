@@ -1,0 +1,22 @@
+services:
+  local-brain-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: local-brain-mcp
+    ports:
+      - "3000:3000"
+    environment:
+      MEMORY_DB_URL: /data/memory.db
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_SITE_URL: ${OPENROUTER_SITE_URL:-}
+      OPENROUTER_APP_NAME: ${OPENROUTER_APP_NAME:-}
+    volumes:
+      - memory_data:/data
+    restart: unless-stopped
+
+volumes:
+  memory_data:
