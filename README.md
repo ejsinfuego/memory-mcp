@@ -79,6 +79,49 @@ You should see FastMCP start up and log something like:
 
 You can then point Cursor (or another MCP client) at `http://localhost:3000/mcp` as a remote MCP server.
 
+Run with Docker Compose
+-----------------------
+
+If you prefer running this in Docker, use the included `docker-compose.yml`.
+
+1) **Set env vars (optional, for embeddings)**
+
+Create a `.env` file in the project root (or export env vars in your shell):
+
+```bash
+# .env example
+EMBEDDING_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+EMBEDDING_MODEL=text-embedding-3-small
+```
+
+2) **Build and start**
+
+```bash
+docker compose up -d --build
+# or, on systems with the legacy CLI:
+docker-compose up -d --build
+```
+
+3) **Use the MCP endpoint**
+
+The server is available at:
+
+- `http://localhost:3000/mcp`
+
+4) **Stop the service**
+
+```bash
+docker compose down
+# or:
+docker-compose down
+```
+
+Notes:
+
+- SQLite data is persisted in the Docker volume `memory_data`.
+- Inside the container, the DB path is set to `MEMORY_DB_URL=/data/memory.db`.
+
 Cursor integration note (local env auto-load)
 ---------------------------------------------
 
