@@ -17,7 +17,7 @@ Features
   - `save_memory` — insert a memory row (optionally generating an embedding).
   - `update_memory` — patch `title` / `content` / `tags` / `source` on an existing row; optional embedding refresh when `content` changes.
   - `delete_memory` — remove a row by id (embeddings removed with it).
-  - `fetch_memories` — RAG-style retrieval (`use_vector_search`, default on). A query is ranked by similarity, not by date. A blank query returns the newest saved rows first. There is no sort parameter. Each row includes `id`, `created_at`, `title`, `content`, `tags`, and `source`.
+  - `fetch_memories` — RAG-style retrieval (`use_vector_search`, default on). A query is ranked by similarity, not by date. A blank query returns the newest saved rows first. There is no sort parameter. Each row includes `id`, `created_at`, `title`, `content`, `tags`, `source`, `mode` (`vector`, `keyword`, or `recent`), and `score`.
   - `backfill_all_embeddings` — generate embeddings for older memories that don’t have one yet (after you configure an embedding provider).
   - `doctor` — database path, embedding coverage, vector index, and whether the embedding API responds.
 
@@ -138,7 +138,7 @@ By default, the SQLite file is `~/.local/share/local-brain/memory.db`, outside a
 Notes:
 
 - The `dbUrl` **tool parameter is intentionally ignored** for path resolution.
-- A relative path is rejected. That keeps a second checkout from creating another database.
+- A relative path is rejected, including when the server starts. That keeps a second checkout from creating another database.
 
 Tables:
 
@@ -206,14 +206,14 @@ Parameters:
 - `use_vector_search` (bool, optional, default `True`): RAG-style retrieval.
   - `True` (default): embed the query and return memories ranked by semantic similarity; falls back to keyword search if embeddings are unavailable.
   - `False`: keyword-only — SQL `LIKE` on `content` and `title`, ordered by recency.
-- `fields` (list of str, optional): if set, each result includes only these keys. Allowed: `id`, `created_at`, `title`, `content`, `tags`, `source`, `retrieval`, `score`. Omit for all fields. Useful to shrink MCP tool payloads (e.g. exclude `content` when listing or probing).
+- `fields` (list of str, optional): if set, each result includes only these keys. Allowed: `id`, `created_at`, `title`, `content`, `tags`, `source`, `mode`, `retrieval`, `score`. Omit for all fields. Useful to shrink MCP tool payloads (e.g. exclude `content` when listing or probing).
 - `tags_any` (list of str, optional): if set, return only rows containing at least one of the provided tags (case-insensitive).
 - `source_prefix` (str, optional): if set, return only rows where `source` starts with this prefix.
 
 Returns:
 
-- A list of dicts. By default each includes `id`, `created_at`, `title`, `content`, `tags`, `source`, `retrieval`, and `score`.
-- `retrieval` is `vector` (embedding similarity), `keyword` (text match, including when the embedding API is unavailable), or `recent` (no query).
+- A list of dicts. By default each includes `id`, `created_at`, `title`, `content`, `tags`, `source`, `mode`, `retrieval`, and `score`.
+- `mode` is `vector` (embedding similarity), `keyword` (text match, including when the embedding API is unavailable), or `recent` (no query). `retrieval` repeats that same value.
 - `score` is cosine similarity for vector hits. It is `null` for keyword and recent results.
 - With `fields`, only the requested keys are present.
 
