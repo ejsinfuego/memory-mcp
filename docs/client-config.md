@@ -9,12 +9,12 @@ Because the server runs **locally** on your machine, Cursor connects to it at `h
   "url": "http://localhost:3000/mcp",
   "headers": {},
   "env": {
-    "DB_URL": "memory.db"
+    "dbUrl": "/Users/you/.local/share/local-brain/memory.db"
   }
 }
 ```
 
-The `env.DB_URL` value is optional; it sets the database file the **server** will use (the server checks `dbUrl`, `DB_URL`, then `MEMORY_DB_URL`, then defaults to `memory.db`).
+The database path is optional. When it is omitted, the server uses `~/.local/share/local-brain/memory.db`. `dbUrl`, `DB_URL`, and `MEMORY_DB_URL` are checked in that order, and the value must be an absolute path.
 
 Notes:
 
