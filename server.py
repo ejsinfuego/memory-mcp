@@ -52,11 +52,16 @@ def _get_env(key: str, default: Optional[str] = None) -> Optional[str]:
 	return default
 
 
+def _default_db_path() -> Path:
+	"""Single database location outside any git checkout."""
+	return Path.home() / ".local" / "share" / "local-brain" / "memory.db"
+
+
 DEFAULT_DB_URL = (
 	_get_env("dbUrl")
 	or _get_env("DB_URL")
 	or _get_env("MEMORY_DB_URL")
-	or "memory.db"
+	or str(_default_db_path())
 )
 
 EMBEDDING_PROVIDER = _get_env("EMBEDDING_PROVIDER", "openai")
@@ -82,6 +87,9 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
 );
 """
 
+# text-embedding-3-small. The sqlite-vec table is created at this width.
+VEC_DIMS = 1536
+
 
 def _resolve_db_path(_db_url: Optional[str]) -> Path:
 	"""
@@ -101,17 +109,36 @@ def _resolve_db_path(_db_url: Optional[str]) -> Path:
 
 	p = Path(raw)
 	if not p.is_absolute():
-		p = Path.cwd() / p
+		raise ValueError(
+			"Database path must be absolute so every checkout shares one file. "
+			f"Got {raw!r}. Set dbUrl to an absolute path, or unset it to use {_default_db_path()}."
+		)
 	return p
 
 
 def _get_connection(db_url: Optional[str]) -> sqlite3.Connection:
 	path = _resolve_db_path(db_url)
+	path.parent.mkdir(parents=True, exist_ok=True)
 	conn = sqlite3.connect(path)
 	conn.row_factory = sqlite3.Row
 	conn.execute("PRAGMA foreign_keys = ON")
 	conn.execute(CREATE_TABLE_SQL)
 	conn.execute(CREATE_EMBEDDINGS_SQL)
+	conn.execute(
+		"""
+		CREATE TABLE IF NOT EXISTS retrieval_events (
+		  id INTEGER PRIMARY KEY AUTOINCREMENT,
+		  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		  query TEXT,
+		  retrieval TEXT NOT NULL,
+		  memory_ids TEXT NOT NULL,
+		  scores TEXT
+		)
+		"""
+	)
+	columns = {row[1] for row in conn.execute("PRAGMA table_info(retrieval_events)")}
+	if "action" not in columns:
+		conn.execute("ALTER TABLE retrieval_events ADD COLUMN action TEXT")
 	return conn
 
 
@@ -191,6 +218,107 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 	return dot / (norm_a * norm_b)
 
 
+def _similarity_score(distance_or_cosine: float, *, from_distance: bool) -> float:
+	"""Higher is a closer match. sqlite-vec cosine distance is 1 - cosine similarity."""
+	value = (1.0 - distance_or_cosine) if from_distance else distance_or_cosine
+	if value < 0.0:
+		return 0.0
+	if value > 1.0:
+		return 1.0
+	return round(value, 4)
+
+
+def _load_sqlite_vec(conn: sqlite3.Connection) -> bool:
+	"""Enable the sqlite-vec index. Returns False when the extension cannot load."""
+	try:
+		import sqlite_vec
+
+		conn.enable_load_extension(True)
+		sqlite_vec.load(conn)
+		conn.enable_load_extension(False)
+		conn.execute(
+			f"""
+			CREATE VIRTUAL TABLE IF NOT EXISTS memory_vec USING vec0(
+				embedding float[{VEC_DIMS}] distance_metric=cosine
+			)
+			"""
+		)
+		return True
+	except Exception:
+		return False
+
+
+def _serialize_vec(vec: List[float]):
+	import sqlite_vec
+
+	return sqlite_vec.serialize_float32(vec)
+
+
+def _store_embedding(conn: sqlite3.Connection, memory_id: int, vec: List[float]) -> None:
+	conn.execute(
+		"INSERT OR REPLACE INTO memory_embeddings (memory_id, model, embedding) VALUES (?, ?, ?)",
+		(memory_id, EMBEDDING_MODEL, json.dumps(vec)),
+	)
+	if len(vec) != VEC_DIMS or not _load_sqlite_vec(conn):
+		return
+	conn.execute("DELETE FROM memory_vec WHERE rowid = ?", (memory_id,))
+	conn.execute(
+		"INSERT INTO memory_vec(rowid, embedding) VALUES (?, ?)",
+		(memory_id, _serialize_vec(vec)),
+	)
+
+
+def _clear_embedding(conn: sqlite3.Connection, memory_id: int) -> None:
+	conn.execute("DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,))
+	if not _load_sqlite_vec(conn):
+		return
+	conn.execute("DELETE FROM memory_vec WHERE rowid = ?", (memory_id,))
+
+
+def _sync_vec_index(conn: sqlite3.Connection) -> None:
+	"""Copy any JSON embeddings for the current model into the vec index."""
+	if not _load_sqlite_vec(conn):
+		return
+	json_ids = {
+		row[0]
+		for row in conn.execute(
+			"SELECT memory_id FROM memory_embeddings WHERE model = ?",
+			(EMBEDDING_MODEL,),
+		)
+	}
+	vec_ids = {row[0] for row in conn.execute("SELECT rowid FROM memory_vec")}
+	missing = json_ids - vec_ids
+	if missing:
+		placeholders = ",".join("?" for _ in missing)
+		rows = conn.execute(
+			f"SELECT memory_id, embedding FROM memory_embeddings WHERE memory_id IN ({placeholders})",
+			tuple(missing),
+		).fetchall()
+		for memory_id, raw in rows:
+			try:
+				vec = json.loads(raw)
+			except json.JSONDecodeError:
+				continue
+			if not isinstance(vec, list) or len(vec) != VEC_DIMS:
+				continue
+			conn.execute(
+				"INSERT INTO memory_vec(rowid, embedding) VALUES (?, ?)",
+				(memory_id, _serialize_vec(vec)),
+			)
+	for memory_id in vec_ids - json_ids:
+		conn.execute("DELETE FROM memory_vec WHERE rowid = ?", (memory_id,))
+	if missing or (vec_ids - json_ids):
+		conn.commit()
+
+
+def _embedding_stored(conn: sqlite3.Connection, memory_id: int) -> bool:
+	row = conn.execute(
+		"SELECT 1 FROM memory_embeddings WHERE memory_id = ?",
+		(memory_id,),
+	).fetchone()
+	return row is not None
+
+
 def _search_memories_keyword(
 	conn: sqlite3.Connection,
 	query: str,
@@ -232,19 +360,83 @@ def _fetch_latest_memories(
 	return _apply_memory_filters(rows, limit, tags_any, source_prefix)
 
 
+def _rows_for_ids(conn: sqlite3.Connection, memory_ids: List[int]) -> dict[int, sqlite3.Row]:
+	if not memory_ids:
+		return {}
+	placeholders = ",".join("?" for _ in memory_ids)
+	rows = conn.execute(
+		f"""
+		SELECT id, created_at, title, content, tags, source
+		FROM memories
+		WHERE id IN ({placeholders})
+		""",
+		tuple(memory_ids),
+	).fetchall()
+	return {row["id"]: row for row in rows}
+
+
+def _search_with_sqlite_vec(
+	conn: sqlite3.Connection,
+	query_embedding: List[float],
+	limit: int,
+	tags_any: Optional[Set[str]],
+	source_prefix: Optional[str],
+) -> Optional[Tuple[List[sqlite3.Row], dict]]:
+	"""Nearest neighbors via sqlite-vec. None means the extension is unavailable."""
+	if len(query_embedding) != VEC_DIMS or not _load_sqlite_vec(conn):
+		return None
+	_sync_vec_index(conn)
+	indexed = conn.execute("SELECT COUNT(*) FROM memory_vec").fetchone()[0]
+	if indexed == 0:
+		return None
+
+	k = indexed if (tags_any or source_prefix) else limit
+	k = max(1, min(int(indexed), max(k, limit)))
+	hits = conn.execute(
+		"""
+		SELECT rowid, distance
+		FROM memory_vec
+		WHERE embedding MATCH ?
+		  AND k = ?
+		""",
+		(_serialize_vec(query_embedding), k),
+	).fetchall()
+	ordered_ids = [row[0] for row in hits]
+	id_to_row = _rows_for_ids(conn, ordered_ids)
+	scores: dict[int, float] = {}
+	matched: List[sqlite3.Row] = []
+	for rowid, distance in hits:
+		row = id_to_row.get(rowid)
+		if row is None or not _row_matches_filters(row, tags_any, source_prefix):
+			continue
+		scores[rowid] = _similarity_score(float(distance), from_distance=True)
+		matched.append(row)
+		if len(matched) >= limit:
+			break
+	return matched, scores
+
+
 def _search_memories_vector(
 	conn: sqlite3.Connection,
 	query: str,
 	limit: int,
 	tags_any: Optional[Set[str]] = None,
 	source_prefix: Optional[str] = None,
-) -> List[sqlite3.Row]:
+) -> Tuple[str, List[sqlite3.Row], dict]:
 	query_embedding = _embed_text(query)
 	if query_embedding is None:
-		# Fallback to keyword search if embeddings are not configured.
-		return _search_memories_keyword(conn, query, limit, tags_any, source_prefix)
+		return (
+			"keyword",
+			_search_memories_keyword(conn, query, limit, tags_any, source_prefix),
+			{},
+		)
 
-	# Load all embeddings for this model.
+	vec_hit = _search_with_sqlite_vec(
+		conn, query_embedding, limit, tags_any, source_prefix
+	)
+	if vec_hit is not None:
+		return "vector", vec_hit[0], vec_hit[1]
+
 	cursor = conn.execute(
 		"""
     SELECT
@@ -263,14 +455,14 @@ def _search_memories_vector(
 		(EMBEDDING_MODEL,),
 	)
 	rows = cursor.fetchall()
-
 	if not rows:
-		# If we have no stored embeddings yet, fall back to keyword search
-		# rather than returning an empty result set.
-		return _search_memories_keyword(conn, query, limit, tags_any, source_prefix)
+		return (
+			"keyword",
+			_search_memories_keyword(conn, query, limit, tags_any, source_prefix),
+			{},
+		)
 
-	# Compute cosine similarity in Python.
-	scores: List[Tuple[int, float]] = []
+	scores_list: List[Tuple[int, float]] = []
 	id_to_row: dict[int, sqlite3.Row] = {}
 	for row in rows:
 		if not _row_matches_filters(row, tags_any, source_prefix):
@@ -280,16 +472,18 @@ def _search_memories_vector(
 			score = _cosine_similarity(query_embedding, vec)
 		except Exception:
 			continue
-		scores.append((row["memory_id"], score))
+		scores_list.append((row["memory_id"], score))
 		id_to_row[row["memory_id"]] = row
 
-	# Sort by similarity descending and take top N ids.
-	scores.sort(key=lambda item: item[1], reverse=True)
-	top_ids = [memory_id for memory_id, _ in scores[:limit] if memory_id is not None]
-
-	if not top_ids:
-		return []
-	return [id_to_row[memory_id] for memory_id in top_ids if memory_id in id_to_row]
+	scores_list.sort(key=lambda item: item[1], reverse=True)
+	top = scores_list[:limit]
+	score_map = {
+		memory_id: _similarity_score(score, from_distance=False)
+		for memory_id, score in top
+		if memory_id is not None
+	}
+	ordered = [id_to_row[memory_id] for memory_id in score_map if memory_id in id_to_row]
+	return "vector", ordered, score_map
 
 
 def _normalize_tag_filter(tags_any: Optional[List[str]]) -> Optional[Set[str]]:
@@ -355,7 +549,7 @@ def _apply_memory_filters(
 
 
 _FETCH_MEMORY_FIELD_NAMES = frozenset(
-	{"id", "created_at", "title", "content", "tags", "source"}
+	{"id", "created_at", "title", "content", "tags", "source", "retrieval", "score"}
 )
 
 
@@ -374,7 +568,11 @@ def _normalize_fetch_fields(fields: Optional[List[str]]) -> Optional[frozenset]:
 
 
 def _memory_row_to_result_dict(
-	row: sqlite3.Row, parsed_tags: List[str], field_set: Optional[frozenset]
+	row: sqlite3.Row,
+	parsed_tags: List[str],
+	field_set: Optional[frozenset],
+	retrieval: str,
+	score: Optional[float],
 ) -> dict:
 	full = {
 		"id": row["id"],
@@ -383,6 +581,8 @@ def _memory_row_to_result_dict(
 		"content": row["content"],
 		"tags": parsed_tags,
 		"source": row["source"],
+		"retrieval": retrieval,
+		"score": score,
 	}
 	if field_set is None:
 		return full
@@ -423,21 +623,19 @@ def save_memory(
 			),
 		)
 		memory_id = cursor.lastrowid
+		embedded = False
 
 		if generate_embedding:
 			try:
 				vec = _embed_text(content)
-				if vec is None:
-					raise RuntimeError("Embedding backend not configured")
-
-				conn.execute(
-					"INSERT OR REPLACE INTO memory_embeddings (memory_id, model, embedding) VALUES (?, ?, ?)",
-					(memory_id, EMBEDDING_MODEL, json.dumps(vec)),
-				)
+				if vec is not None:
+					_store_embedding(conn, memory_id, vec)
+					embedded = True
 			except Exception:
-				# If embedding fails, still keep the textual memory.
-				pass
+				# Keep the textual memory even when the embedding API fails.
+				embedded = False
 
+		_log_activity(conn, "save_memory", [int(memory_id)])
 		conn.commit()
 	finally:
 		conn.close()
@@ -448,6 +646,7 @@ def save_memory(
 		"content": content,
 		"tags": tags or [],
 		"source": source,
+		"embedded": embedded,
 	}
 
 
@@ -514,22 +713,20 @@ def update_memory(
 			(new_title, new_content, new_tags_json, new_source, memory_id),
 		)
 
+		embedded = _embedding_stored(conn, memory_id)
 		if content_changed:
-			conn.execute(
-				"DELETE FROM memory_embeddings WHERE memory_id = ?",
-				(memory_id,),
-			)
+			_clear_embedding(conn, memory_id)
+			embedded = False
 			if generate_embedding:
 				try:
 					vec = _embed_text(new_content)
 					if vec is not None:
-						conn.execute(
-							"INSERT INTO memory_embeddings (memory_id, model, embedding) VALUES (?, ?, ?)",
-							(memory_id, EMBEDDING_MODEL, json.dumps(vec)),
-						)
+						_store_embedding(conn, memory_id, vec)
+						embedded = True
 				except Exception:
-					pass
+					embedded = False
 
+		_log_activity(conn, "update_memory", [int(memory_id)])
 		conn.commit()
 	finally:
 		conn.close()
@@ -540,6 +737,7 @@ def update_memory(
 		"content": new_content,
 		"tags": parsed_tags,
 		"source": new_source,
+		"embedded": embedded,
 	}
 
 
@@ -551,9 +749,12 @@ def delete_memory(memory_id: int, dbUrl: Optional[str] = None) -> dict:
 	"""
 	conn = _get_connection(dbUrl)
 	try:
+		_clear_embedding(conn, memory_id)
 		cur = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-		conn.commit()
 		deleted = cur.rowcount > 0
+		if deleted:
+			_log_activity(conn, "delete_memory", [int(memory_id)])
+		conn.commit()
 	finally:
 		conn.close()
 
@@ -580,11 +781,34 @@ def fetch_memories(
 	- limit: maximum number of results to return (default 5, max 50).
 	- dbUrl: optional database URL or path (file: URL or filesystem path).
 	- use_vector_search: if True (default), use RAG/semantic retrieval; if False, keyword-only.
-	- fields: optional subset of keys to return per row: id, created_at, title, content, tags, source.
+	- fields: optional subset of keys to return per row: id, created_at, title, content, tags, source, retrieval, score.
 	  Omit or pass null for all fields. Requesting fewer fields (e.g. without content) reduces tool payload size.
+	  `retrieval` is `vector`, `keyword`, or `recent`. `score` is cosine similarity for vector hits, otherwise null.
 	- tags_any: optional list of tags; when provided, return only rows that contain at least one of these tags.
 	- source_prefix: optional source prefix; when provided, return only rows where source starts with this prefix.
 	"""
+	found = retrieve_memories(
+		query=query,
+		limit=limit,
+		dbUrl=dbUrl,
+		use_vector_search=use_vector_search,
+		fields=fields,
+		tags_any=tags_any,
+		source_prefix=source_prefix,
+	)
+	return found["results"]
+
+
+def retrieve_memories(
+	query: Optional[str] = None,
+	limit: int = 5,
+	dbUrl: Optional[str] = None,
+	use_vector_search: bool = True,
+	fields: Optional[List[str]] = None,
+	tags_any: Optional[List[str]] = None,
+	source_prefix: Optional[str] = None,
+) -> dict:
+	"""Same lookup as fetch_memories, plus the retrieval mode when the result list is empty."""
 	if limit <= 0:
 		raise ValueError("limit must be positive")
 	if limit > 50:
@@ -596,15 +820,27 @@ def fetch_memories(
 
 	conn = _get_connection(dbUrl)
 	try:
-		# If no query is provided, return the latest memories instead of erroring.
 		if query is None or not str(query).strip():
+			retrieval = "recent"
 			rows = _fetch_latest_memories(conn, limit, tag_filter, source_filter)
+			scores: dict = {}
 		elif use_vector_search:
-			rows = _search_memories_vector(
+			retrieval, rows, scores = _search_memories_vector(
 				conn, query, limit, tag_filter, source_filter
 			)
 		else:
+			retrieval = "keyword"
 			rows = _search_memories_keyword(conn, query, limit, tag_filter, source_filter)
+			scores = {}
+		_log_activity(
+			conn,
+			"retrieve_memories",
+			[int(row["id"]) for row in rows],
+			query="" if query is None else str(query).strip(),
+			retrieval=retrieval,
+			scores=scores,
+		)
+		conn.commit()
 	finally:
 		conn.close()
 
@@ -616,9 +852,47 @@ def fetch_memories(
 		except json.JSONDecodeError:
 			parsed_tags = []
 
-		results.append(_memory_row_to_result_dict(row, parsed_tags, field_set))
+		results.append(
+			_memory_row_to_result_dict(
+				row,
+				parsed_tags,
+				field_set,
+				retrieval,
+				scores.get(row["id"]),
+			)
+		)
 
-	return results
+	return {"retrieval": retrieval, "results": results}
+
+
+def _log_activity(
+	conn: sqlite3.Connection,
+	action: str,
+	memory_ids: List[int],
+	query: str = "",
+	retrieval: str = "",
+	scores: Optional[dict] = None,
+) -> None:
+	"""Record a server call so the live graph can add, move, or remove memories."""
+	score_payload = {str(memory_id): value for memory_id, value in (scores or {}).items()}
+	conn.execute(
+		"""
+		INSERT INTO retrieval_events (query, retrieval, memory_ids, scores, action)
+		VALUES (?, ?, ?, ?, ?)
+		""",
+		(
+			query,
+			retrieval or action,
+			json.dumps(memory_ids),
+			json.dumps(score_payload),
+			action,
+		),
+	)
+	cutoff = conn.execute(
+		"SELECT COALESCE(MAX(id), 0) - 200 FROM retrieval_events"
+	).fetchone()[0]
+	if cutoff and cutoff > 0:
+		conn.execute("DELETE FROM retrieval_events WHERE id < ?", (cutoff,))
 
 
 def backfill_embeddings(db_url: Optional[str] = None) -> dict:
@@ -641,6 +915,7 @@ def backfill_embeddings(db_url: Optional[str] = None) -> dict:
 		rows = cursor.fetchall()
 		created = 0
 		failed = 0
+		created_ids: List[int] = []
 		for row in rows:
 			memory_id, content = row["id"], row["content"]
 			try:
@@ -648,13 +923,12 @@ def backfill_embeddings(db_url: Optional[str] = None) -> dict:
 				if vec is None:
 					failed += 1
 					continue
-				conn.execute(
-					"INSERT OR REPLACE INTO memory_embeddings (memory_id, model, embedding) VALUES (?, ?, ?)",
-					(memory_id, EMBEDDING_MODEL, json.dumps(vec)),
-				)
+				_store_embedding(conn, memory_id, vec)
 				created += 1
+				created_ids.append(int(memory_id))
 			except Exception:
 				failed += 1
+		_log_activity(conn, "backfill_embeddings", created_ids)
 		conn.commit()
 		return {
 			"backfilled": created,
@@ -674,6 +948,139 @@ def backfill_all_embeddings(dbUrl: Optional[str] = None) -> dict:
 	memories become available for semantic (RAG-style) retrieval.
 	"""
 	return backfill_embeddings(dbUrl)
+
+
+def reembed_embeddings(db_url: Optional[str] = None) -> dict:
+	"""Re-embed rows with no vector or a vector from a different model."""
+	conn = _get_connection(db_url)
+	try:
+		rows = conn.execute(
+			"""
+			SELECT m.id, m.content
+			FROM memories m
+			LEFT JOIN memory_embeddings e ON m.id = e.memory_id
+			WHERE e.memory_id IS NULL OR e.model != ?
+			ORDER BY m.id
+			""",
+			(EMBEDDING_MODEL,),
+		).fetchall()
+		reembedded = 0
+		failed = 0
+		reembedded_ids: List[int] = []
+		for row in rows:
+			try:
+				vec = _embed_text(row["content"])
+				if vec is None:
+					failed += 1
+					continue
+				_clear_embedding(conn, row["id"])
+				_store_embedding(conn, row["id"], vec)
+				reembedded += 1
+				reembedded_ids.append(int(row["id"]))
+			except Exception:
+				failed += 1
+		_log_activity(conn, "reembed_embeddings", reembedded_ids)
+		conn.commit()
+		return {
+			"reembedded": reembedded,
+			"failed": failed,
+			"total": len(rows),
+			"model": EMBEDDING_MODEL,
+		}
+	finally:
+		conn.close()
+
+
+@mcp.tool
+def doctor(ping: bool = True) -> dict:
+	"""
+	Report whether the memory database and embedding API are healthy.
+
+	- ping: when True (default), send a short embedding request and record success or failure.
+	"""
+	path = _resolve_db_path(None)
+	warnings: List[str] = []
+	report = {
+		"db_path": str(path),
+		"db_exists": path.is_file(),
+		"configured_model": EMBEDDING_MODEL,
+		"embedding_provider": EMBEDDING_PROVIDER,
+		"memories": 0,
+		"embeddings": 0,
+		"missing_embeddings": 0,
+		"model_mismatch_count": 0,
+		"stored_models": {},
+		"vector_index": "python",
+		"embedding_api": "skipped",
+		"warnings": warnings,
+	}
+	if not path.is_file():
+		warnings.append("Database file does not exist yet. It will be created on the next save.")
+		return report
+
+	conn = _get_connection(None)
+	try:
+		report["memories"] = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+		report["embeddings"] = conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
+		report["missing_embeddings"] = conn.execute(
+			"""
+			SELECT COUNT(*) FROM memories m
+			LEFT JOIN memory_embeddings e ON m.id = e.memory_id
+			WHERE e.memory_id IS NULL
+			"""
+		).fetchone()[0]
+		report["model_mismatch_count"] = conn.execute(
+			"SELECT COUNT(*) FROM memory_embeddings WHERE model != ?",
+			(EMBEDDING_MODEL,),
+		).fetchone()[0]
+		report["stored_models"] = {
+			row[0]: row[1]
+			for row in conn.execute(
+				"SELECT model, COUNT(*) FROM memory_embeddings GROUP BY model"
+			)
+		}
+		if _load_sqlite_vec(conn):
+			report["vector_index"] = "sqlite-vec"
+			_sync_vec_index(conn)
+			indexed = conn.execute("SELECT COUNT(*) FROM memory_vec").fetchone()[0]
+			report["vector_index_rows"] = indexed
+			matching_model = conn.execute(
+				"SELECT COUNT(*) FROM memory_embeddings WHERE model = ?",
+				(EMBEDDING_MODEL,),
+			).fetchone()[0]
+			if indexed < matching_model:
+				warnings.append(
+					"Some embeddings for the configured model are not in the sqlite-vec index. "
+					"They may have a different dimension than "
+					f"{VEC_DIMS}."
+				)
+		else:
+			warnings.append(
+				"sqlite-vec is not available. Vector search is computing cosine similarity in Python."
+			)
+	finally:
+		conn.close()
+
+	if report["missing_embeddings"]:
+		warnings.append(
+			f"{report['missing_embeddings']} memories have no embedding and are skipped by vector search."
+		)
+	if report["model_mismatch_count"]:
+		warnings.append(
+			f"{report['model_mismatch_count']} embeddings were built with a different model than "
+			f"{EMBEDDING_MODEL}. Run reembed to include them in vector search."
+		)
+	if ping:
+		try:
+			vec = _embed_text("embedding health check")
+			report["embedding_api"] = "ok" if vec else "failed"
+		except Exception:
+			report["embedding_api"] = "failed"
+		if report["embedding_api"] != "ok":
+			warnings.append(
+				"Embedding API call failed. Semantic search will use keyword matching."
+			)
+	return report
 
 
 if __name__ == "__main__":
