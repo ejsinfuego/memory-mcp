@@ -17,6 +17,6 @@ Local Brain MCP is a small MCP server that you **run locally** on your machine. 
   - `save_memory` — insert a memory row.
   - `update_memory` — patch fields on an existing row.
   - `delete_memory` — delete a row by id.
-  - `fetch_memories` — RAG-style search (semantic by default, keyword fallback) or recent list when `query` is empty. Each row includes `retrieval` and `score`.
+  - `fetch_memories` — RAG-style search (semantic by default, keyword fallback) or recent list when `query` is empty. Each row includes `mode` (`vector`, `keyword`, or `recent`) and `score`.
   - `doctor` — database path, embedding coverage, and whether the embedding API responds.
 
