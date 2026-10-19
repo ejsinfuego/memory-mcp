@@ -2,6 +2,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
@@ -105,9 +106,9 @@ def _resolve_db_path(_db_url: Optional[str]) -> Path:
 		from urllib.parse import urlparse
 
 		parsed = urlparse(raw)
-		return Path(parsed.path)
-
-	p = Path(raw)
+		p = Path(parsed.path)
+	else:
+		p = Path(raw)
 	if not p.is_absolute():
 		raise ValueError(
 			"Database path must be absolute so every checkout shares one file. "
@@ -549,7 +550,7 @@ def _apply_memory_filters(
 
 
 _FETCH_MEMORY_FIELD_NAMES = frozenset(
-	{"id", "created_at", "title", "content", "tags", "source", "retrieval", "score"}
+	{"id", "created_at", "title", "content", "tags", "source", "mode", "retrieval", "score"}
 )
 
 
@@ -581,6 +582,7 @@ def _memory_row_to_result_dict(
 		"content": row["content"],
 		"tags": parsed_tags,
 		"source": row["source"],
+		"mode": retrieval,
 		"retrieval": retrieval,
 		"score": score,
 	}
@@ -781,9 +783,9 @@ def fetch_memories(
 	- limit: maximum number of results to return (default 5, max 50).
 	- dbUrl: optional database URL or path (file: URL or filesystem path).
 	- use_vector_search: if True (default), use RAG/semantic retrieval; if False, keyword-only.
-	- fields: optional subset of keys to return per row: id, created_at, title, content, tags, source, retrieval, score.
+	- fields: optional subset of keys to return per row: id, created_at, title, content, tags, source, mode, retrieval, score.
 	  Omit or pass null for all fields. Requesting fewer fields (e.g. without content) reduces tool payload size.
-	  `retrieval` is `vector`, `keyword`, or `recent`. `score` is cosine similarity for vector hits, otherwise null.
+	  `mode` (and `retrieval`) is `vector`, `keyword`, or `recent`. `score` is cosine similarity for vector hits, otherwise null.
 	- tags_any: optional list of tags; when provided, return only rows that contain at least one of these tags.
 	- source_prefix: optional source prefix; when provided, return only rows where source starts with this prefix.
 	"""
@@ -1029,10 +1031,8 @@ def doctor(ping: bool = True) -> dict:
 			WHERE e.memory_id IS NULL
 			"""
 		).fetchone()[0]
-		report["model_mismatch_count"] = conn.execute(
-			"SELECT COUNT(*) FROM memory_embeddings WHERE model != ?",
-			(EMBEDDING_MODEL,),
-		).fetchone()[0]
+		mismatch = _model_mismatch_message(conn)
+		report["model_mismatch_count"] = _model_mismatch_count(conn)
 		report["stored_models"] = {
 			row[0]: row[1]
 			for row in conn.execute(
@@ -1065,11 +1065,8 @@ def doctor(ping: bool = True) -> dict:
 		warnings.append(
 			f"{report['missing_embeddings']} memories have no embedding and are skipped by vector search."
 		)
-	if report["model_mismatch_count"]:
-		warnings.append(
-			f"{report['model_mismatch_count']} embeddings were built with a different model than "
-			f"{EMBEDDING_MODEL}. Run reembed to include them in vector search."
-		)
+	if mismatch:
+		warnings.append(mismatch)
 	if ping:
 		try:
 			vec = _embed_text("embedding health check")
@@ -1083,8 +1080,44 @@ def doctor(ping: bool = True) -> dict:
 	return report
 
 
+def _model_mismatch_count(conn: sqlite3.Connection) -> int:
+	return conn.execute(
+		"SELECT COUNT(*) FROM memory_embeddings WHERE model != ?",
+		(EMBEDDING_MODEL,),
+	).fetchone()[0]
+
+
+def _model_mismatch_message(conn: sqlite3.Connection) -> Optional[str]:
+	"""Warning text when stored vectors were built with a different model."""
+	count = _model_mismatch_count(conn)
+	if not count:
+		return None
+	return (
+		f"{count} embeddings were built with a different model than "
+		f"{EMBEDDING_MODEL}. Run reembed to include them in vector search."
+	)
+
+
+def prepare_server() -> None:
+	"""Refuse a relative database path, then warn if stored vectors use another model."""
+	try:
+		path = _resolve_db_path(None)
+	except ValueError as exc:
+		raise SystemExit(str(exc)) from exc
+	if not path.is_file():
+		return
+	conn = _get_connection(None)
+	try:
+		message = _model_mismatch_message(conn)
+	finally:
+		conn.close()
+	if message:
+		print(message, file=sys.stderr)
+
+
 if __name__ == "__main__":
 	# Expose the MCP server over HTTP so it can be used via Cloudflare Tunnel.
 	# The MCP endpoint will be available at http://localhost:3000/mcp
+	prepare_server()
 	mcp.run(transport="http", host="0.0.0.0", port=3000)
 
