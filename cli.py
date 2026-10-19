@@ -30,7 +30,7 @@ def _parse_args() -> argparse.Namespace:
 
 	subparsers.add_parser(
 		"backfill-embeddings",
-		help="Embed memories that do not have a vector yet.",
+		help="Generate and store embeddings for memories that don't have one (requires OPENAI_API_KEY or OpenRouter).",
 	)
 	subparsers.add_parser(
 		"reembed",
@@ -87,6 +87,12 @@ def main() -> None:
 	elif args.command == "backfill-embeddings":
 		result = backfill_embeddings(db_url=None)
 		print(json.dumps(result, indent=2))
+		if result["total_without"] == 0:
+			print("No memories missing embeddings.")
+		elif result["failed"] > 0:
+			print(f"Backfilled {result['backfilled']}, {result['failed']} failed (check API key and network).")
+		else:
+			print(f"Backfilled {result['backfilled']} memories.")
 	elif args.command == "reembed":
 		result = reembed_embeddings(db_url=None)
 		print(json.dumps(result, indent=2))
