@@ -48,6 +48,7 @@ class TestRetrievalImprovements(unittest.TestCase):
 		server.save_memory(content="hello", title="hi", generate_embedding=False)
 		found = server.retrieve_memories(query=None, use_vector_search=False)
 		self.assertEqual(found["retrieval"], "recent")
+		self.assertEqual(found["results"][0]["mode"], "recent")
 		self.assertEqual(found["results"][0]["retrieval"], "recent")
 		self.assertIsNone(found["results"][0]["score"])
 
@@ -65,6 +66,7 @@ class TestRetrievalImprovements(unittest.TestCase):
 		server._embed_text = lambda text: _unit_vector(0)
 		found = server.retrieve_memories(query="closest to alpha", limit=2)
 		self.assertEqual(found["retrieval"], "vector")
+		self.assertEqual(found["results"][0]["mode"], "vector")
 		self.assertEqual(found["results"][0]["title"], "alpha")
 		self.assertGreater(found["results"][0]["score"], found["results"][1]["score"])
 
@@ -75,6 +77,7 @@ class TestRetrievalImprovements(unittest.TestCase):
 			use_vector_search=False,
 		)
 		self.assertEqual(found["retrieval"], "keyword")
+		self.assertEqual(found["results"][0]["mode"], "keyword")
 		self.assertEqual(found["results"][0]["title"], "kw")
 		self.assertIsNone(found["results"][0]["score"])
 
@@ -108,6 +111,40 @@ class TestRetrievalImprovements(unittest.TestCase):
 		self.assertEqual(row[0], "recent")
 		self.assertIn("[", row[1])
 		self.assertEqual(row[2], "retrieve_memories")
+
+	def test_startup_refuses_a_relative_database_path(self) -> None:
+		server.DEFAULT_DB_URL = "memory.db"
+		with self.assertRaises(SystemExit) as ctx:
+			server.prepare_server()
+		self.assertIn("absolute", str(ctx.exception).lower())
+
+	def test_doctor_and_startup_warn_on_model_mismatch(self) -> None:
+		import io
+		from contextlib import redirect_stderr
+
+		saved = server.save_memory(content="old vector", title="old", generate_embedding=False)
+		conn = server._get_connection(None)
+		try:
+			server._store_embedding(conn, saved["id"], _unit_vector(0))
+			conn.execute(
+				"UPDATE memory_embeddings SET model = ? WHERE memory_id = ?",
+				("previous-model", saved["id"]),
+			)
+			conn.commit()
+		finally:
+			conn.close()
+
+		report = server.doctor(ping=False)
+		self.assertEqual(report["model_mismatch_count"], 1)
+		joined = " ".join(report["warnings"])
+		self.assertIn("different model", joined)
+		self.assertIn(server.EMBEDDING_MODEL, joined)
+
+		buffer = io.StringIO()
+		with redirect_stderr(buffer):
+			server.prepare_server()
+		self.assertIn("different model", buffer.getvalue())
+		self.assertIn(server.EMBEDDING_MODEL, buffer.getvalue())
 
 	def test_doctor_reports_missing_embeddings_without_ping(self) -> None:
 		server.save_memory(content="bare", generate_embedding=False)
