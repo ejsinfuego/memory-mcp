@@ -119,7 +119,7 @@ def fetch_memories(
 - `limit` (int, optional): max results (default `5`, max `50`).
 - `dbUrl` (string, optional): ignored for path resolution; DB comes from env.
 - `use_vector_search` (bool, optional, default `True`): if `True`, use RAG (embedding-based similarity); falls back to keyword search if embeddings unavailable. If `False`, keyword-only (`LIKE` on `content`/`title`).
-- `fields` (list of strings, optional): if set, each result includes only these keys: `id`, `created_at`, `title`, `content`, `tags`, `source`, `retrieval`, `score`. Omit for all fields.
+- `fields` (list of strings, optional): if set, each result includes only these keys: `id`, `created_at`, `title`, `content`, `tags`, `source`, `mode`, `retrieval`, `score`. Omit for all fields.
 - `tags_any` (list of strings, optional): return only rows that contain at least one of these tags (case-insensitive match).
 - `source_prefix` (string, optional): return only rows whose `source` starts with this prefix.
 
@@ -128,7 +128,7 @@ def fetch_memories(
 - **Default (RAG)**: Embeds the query and returns the nearest memories. sqlite-vec does the nearest-neighbor lookup when it is installed; otherwise cosine similarity is computed in Python. If the embedding API fails or no vectors exist, the same call uses keyword search.
 - **Keyword-only** (`use_vector_search=False`): `LIKE` on `content` and `title`, ordered by recency.
 - **Filters**: `tags_any` and `source_prefix` apply to recent, keyword, and vector retrieval paths.
-- Returns a list of objects. Default keys: `id`, `created_at`, `title`, `content`, `tags` (parsed list), `source`, `retrieval` (`vector`, `keyword`, or `recent`), and `score` (cosine similarity for vector hits, otherwise `null`).
+- Returns a list of objects. Default keys: `id`, `created_at`, `title`, `content`, `tags` (parsed list), `source`, `mode` (`vector`, `keyword`, or `recent`), `retrieval` (the same value as `mode`), and `score` (cosine similarity for vector hits, otherwise `null`).
 - `fields` limits which of those keys are returned.
 
 ## `doctor`
