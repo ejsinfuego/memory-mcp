@@ -24,4 +24,4 @@ The server stores memories in a SQLite database file.
 
 The `dbUrl` *tool argument* is intentionally ignored for path resolution so all clients share the same configured DB.
 
-A relative path is rejected so a second checkout cannot create a separate database.
+A relative path is rejected when the server starts, so a second checkout cannot create a separate database. The same check runs on the first database call. If stored embeddings were built with a different `EMBEDDING_MODEL`, startup prints a warning and `doctor` includes it in `warnings`.
