@@ -17,8 +17,9 @@ Features
   - `save_memory` — insert a memory row (optionally generating an embedding).
   - `update_memory` — patch `title` / `content` / `tags` / `source` on an existing row; optional embedding refresh when `content` changes.
   - `delete_memory` — remove a row by id (embeddings removed with it).
-  - `fetch_memories` — RAG-style retrieval: by default uses semantic vector search over embeddings; falls back to keyword search if embeddings are unavailable.
+  - `fetch_memories` — RAG-style retrieval (`use_vector_search`, default on). A query is ranked by similarity, not by date. A blank query returns the newest saved rows first. There is no sort parameter. Each row includes `id`, `created_at`, `title`, `content`, `tags`, and `source`.
   - `backfill_all_embeddings` — generate embeddings for older memories that don’t have one yet (after you configure an embedding provider).
+  - `doctor` — database path, embedding coverage, vector index, and whether the embedding API responds.
 
 - **Embeddings / vector search**
   - The server does not run an embedding model itself. Embeddings are **handled by OpenAI** (or optionally OpenRouter) via their APIs.
@@ -130,14 +131,14 @@ When you run `server.py` locally, it will also try to load environment overrides
 Database layout
 ---------------
 
-By default, the SQLite file is `memory.db` in the project root. This can be overridden with:
+By default, the SQLite file is `~/.local/share/local-brain/memory.db`, outside any git checkout. Override it with an **absolute** path:
 
 - Env vars: `dbUrl`, `DB_URL`, or `MEMORY_DB_URL` (first non‑empty wins).
 
 Notes:
 
 - The `dbUrl` **tool parameter is intentionally ignored** for path resolution.
-- If the chosen DB path is relative, it is resolved relative to the server’s current working directory.
+- A relative path is rejected. That keeps a second checkout from creating another database.
 
 Tables:
 
@@ -168,7 +169,8 @@ Parameters:
 
 Returns:
 
-- A dict with `id`, `title`, `content`, `tags`, `source`.
+- A dict with `id`, `title`, `content`, `tags`, `source`, `embedded`.
+- `embedded` is `true` when a vector was stored for this save. `false` means the text was kept and vector search will not see it until a later backfill.
 
 **`update_memory`**
 
@@ -180,7 +182,7 @@ Parameters:
 - `title`, `content`, `tags`, `source` (optional): new values; at least one must be provided.
 - `generate_embedding` (bool, default `True`): when `content` changes, if `True` recompute the embedding; if `False`, drop the stored embedding so vector search cannot use stale vectors.
 
-Returns: dict with `id`, `title`, `content`, `tags`, `source`.
+Returns: dict with `id`, `title`, `content`, `tags`, `source`, `embedded`. `embedded` is whether a vector exists after the update.
 
 **`delete_memory`**
 
@@ -198,19 +200,30 @@ Returns: `{ "id": <int>, "deleted": <bool> }` (`deleted` is `False` if no row ex
 
 Parameters:
 
-- `query` (str, optional): text query; if omitted or blank (or whitespace-only), returns the latest memories (recent-first)—a “list recent” behavior, not search.
+- `query` (str, optional): text query. A non-blank query is ranked by similarity (`use_vector_search`) or keyword match. There is no sort or date parameter. If `query` is omitted or blank, results are the newest saved rows first (`created_at` descending).
 - `limit` (int, optional, default `5`, max `50`): max number of results.
 - `dbUrl` (str, optional): accepted for API compatibility, but ignored for database path resolution.
 - `use_vector_search` (bool, optional, default `True`): RAG-style retrieval.
   - `True` (default): embed the query and return memories ranked by semantic similarity; falls back to keyword search if embeddings are unavailable.
   - `False`: keyword-only — SQL `LIKE` on `content` and `title`, ordered by recency.
-- `fields` (list of str, optional): if set, each result includes only these keys. Allowed: `id`, `created_at`, `title`, `content`, `tags`, `source`. Omit for all fields. Useful to shrink MCP tool payloads (e.g. exclude `content` when listing or probing).
+- `fields` (list of str, optional): if set, each result includes only these keys. Allowed: `id`, `created_at`, `title`, `content`, `tags`, `source`, `retrieval`, `score`. Omit for all fields. Useful to shrink MCP tool payloads (e.g. exclude `content` when listing or probing).
 - `tags_any` (list of str, optional): if set, return only rows containing at least one of the provided tags (case-insensitive).
 - `source_prefix` (str, optional): if set, return only rows where `source` starts with this prefix.
 
 Returns:
 
-- A list of dicts; by default each includes `id`, `created_at`, `title`, `content`, `tags`, `source`. With `fields`, only the requested keys are present.
+- A list of dicts. By default each includes `id`, `created_at`, `title`, `content`, `tags`, `source`, `retrieval`, and `score`.
+- `retrieval` is `vector` (embedding similarity), `keyword` (text match, including when the embedding API is unavailable), or `recent` (no query).
+- `score` is cosine similarity for vector hits. It is `null` for keyword and recent results.
+- With `fields`, only the requested keys are present.
+
+**`doctor`**
+
+**Purpose**: Check the database path, how many memories lack a vector, whether stored vectors match `EMBEDDING_MODEL`, which index is in use (`sqlite-vec` or Python), and whether a live embedding call succeeds.
+
+Parameters:
+
+- `ping` (bool, default `True`): send a short embedding request.
 
 Using this as a RAG memory
 --------------------------
@@ -235,7 +248,25 @@ Typical pattern for an AI assistant:
 Embedding backfill (recommended after enabling embeddings)
 ---------------------------------------------------------
 
-If you set an embedding provider/API key after you already have memories saved, run `backfill_all_embeddings` once to generate embeddings for older rows so semantic search works across your full history.
+If you set an embedding provider/API key after you already have memories saved, run `backfill_all_embeddings` once to generate embeddings for older rows so semantic search works across your full history. If `EMBEDDING_MODEL` changes, run `python cli.py reembed` so older vectors are rebuilt and included in search.
+
+Command line
+------------
+
+`cli.py` uses the same database as the server:
+
+```bash
+python cli.py list
+python cli.py search "how do we start a campaign from a folder"
+python cli.py search "exact error text" --keyword
+python cli.py doctor
+python cli.py reembed
+python cli.py dashboard
+```
+
+`dashboard` serves a live graph at `http://127.0.0.1:8765`. Each memory is a node, and each line connects it to the two notes with the closest embeddings. The page polls `GET /events?after=<id>` every second and reads new rows from `retrieval_events`. Those rows are written by `_log_activity` inside `save_memory`, `update_memory`, `delete_memory`, `retrieve_memories` (which `fetch_memories` calls), `backfill_embeddings`, and `reembed_embeddings`. A save adds a node, an update moves it, a delete removes it, and a search lights up the matches.
+
+Run `python server.py` from **this** checkout. The copy at `/Users/ej/Desktop/work/memory-mcp` does not write `retrieval_events`, so the graph stays still even though both processes use `~/.local/share/local-brain/memory.db`.
 
 Development notes
 -----------------

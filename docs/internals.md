@@ -6,10 +6,10 @@ The main server implementation lives in `server.py`.
 
 ### `_resolve_db_path(db_url: Optional[str]) -> Path`
 
-Resolves a `dbUrl` argument or environment setting into an absolute `Path`.
+Resolves the configured database path into an absolute `Path`. The `dbUrl` tool argument is ignored.
 
 - Supports `file:` URLs (e.g. `file:///home/user/memory.db`).
-- Treats relative paths as relative to the current working directory.
+- Rejects relative paths. The default is `~/.local/share/local-brain/memory.db`.
 
 ### `_get_connection(db_url: Optional[str]) -> sqlite3.Connection`
 
@@ -22,7 +22,7 @@ from fastmcp import FastMCP
 
 mcp = FastMCP("Local Brain MCP")
 
-# tools: save_memory, update_memory, delete_memory, fetch_memories, backfill_all_embeddings
+# tools: save_memory, update_memory, delete_memory, fetch_memories, backfill_all_embeddings, doctor
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=3000)

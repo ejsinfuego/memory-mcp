@@ -16,12 +16,12 @@ FastMCP will run an HTTP server that exposes the MCP endpoint at `/mcp`.
 
 The server stores memories in a SQLite database file.
 
-- **Default**: `./memory.db` in the current working directory.
-- **Override via environment** (checked in this order):
+- **Default**: `~/.local/share/local-brain/memory.db` (outside any git checkout).
+- **Override via environment** (checked in this order). The value must be an absolute path:
   - `dbUrl`
   - `DB_URL`
   - `MEMORY_DB_URL`
 
 The `dbUrl` *tool argument* is intentionally ignored for path resolution so all clients share the same configured DB.
 
-All (relative) DB paths are resolved relative to the server’s current working directory.
+A relative path is rejected so a second checkout cannot create a separate database.
