@@ -47,7 +47,7 @@
     button { cursor: pointer; }
     #status { min-width: 220px; color: var(--muted); font-size: 12px; padding-bottom: 6px; }
     #stage { flex: 1; display: flex; min-height: 0; }
-    canvas { flex: 1; width: 100%; display: block; touch-action: none; }
+    canvas { flex: 1; width: 100%; display: block; touch-action: none; cursor: grab; }
     aside {
       width: 320px;
       border-left: 1px solid var(--line);
@@ -71,10 +71,10 @@
     <p id="status" role="status">Waiting for a server call.</p>
   </header>
   <div id="stage">
-    <canvas id="view" aria-label="Memories linked by embedding similarity. Drag a node, scroll to zoom, or click a memory to read it."></canvas>
+    <canvas id="view" aria-label="Three-dimensional memory graph. Drag to orbit, scroll to zoom, shift-drag to pan, click a memory to read it, double-click to fly closer."></canvas>
     <aside id="detail" aria-live="polite">
       <h2 id="detail-title">Select a memory</h2>
-      <p id="detail-meta">Click a node, or search. Drag the background to pan and scroll to zoom.</p>
+      <p id="detail-meta">Drag to orbit, scroll to zoom, shift-drag to pan. Click a memory to read it. Double-click a memory to fly in, or double-click empty space to frame everything.</p>
       <p id="detail-body"></p>
     </aside>
   </div>
@@ -91,8 +91,19 @@
     let selectedId = null;
     let hoverId = null;
     let drag = null;
-    const camera = { x: 0, y: 0, k: 1 };
+    let fly = null;
+    let userMoved = false;
+    const hoverNeighborIds = new Set();
     const neighborIds = new Set();
+    const camera = {
+      yaw: 0.55,
+      pitch: 0.34,
+      distance: 900,
+      targetX: 0,
+      targetY: 0,
+      targetZ: 0,
+    };
+    let lastClick = { t: 0, x: 0, y: 0, id: null };
 
     function resize() {
       canvas.width = canvas.clientWidth * devicePixelRatio;
@@ -101,10 +112,23 @@
     window.addEventListener("resize", resize);
     resize();
 
+    function viewSize() {
+      return {
+        width: canvas.clientWidth || 1200,
+        height: canvas.clientHeight || 800,
+      };
+    }
+
+    function focalLength() {
+      const { width, height } = viewSize();
+      return Math.min(width, height) * 0.9;
+    }
+
     function kick(node, scale) {
       const angle = Math.random() * Math.PI * 2;
       node.vx += Math.cos(angle) * scale;
       node.vy += Math.sin(angle) * scale;
+      node.vz += (Math.random() - 0.5) * scale;
       node.hot = performance.now() + 6000;
     }
 
@@ -117,12 +141,22 @@
       const node = {
         id,
         title: title || String(id),
-        x: canvas.clientWidth / 2 + (Math.random() - 0.5) * 30,
-        y: canvas.clientHeight / 2 + (Math.random() - 0.5) * 30,
+        x: 0,
+        y: 0,
+        z: 0,
         vx: 0,
         vy: 0,
+        vz: 0,
+        hx: null,
+        hy: null,
+        hz: null,
         hot: 0,
         tone: "",
+        fresh: true,
+        sx: -9999,
+        sy: -9999,
+        cz: 1,
+        screenR: 3,
       };
       nodes.push(node);
       byId.set(id, node);
@@ -139,6 +173,8 @@
         if (links[i].source.id === id || links[i].target.id === id) links.splice(i, 1);
       }
       neighborIds.delete(id);
+      hoverNeighborIds.delete(id);
+      if (hoverId === id) hoverId = null;
       if (selectedId === id) {
         selectedId = null;
         neighborIds.clear();
@@ -168,11 +204,45 @@
       const node = addNode(detail.id, detail.title);
       node.tone = tone;
       replaceLinks(id, detail.links || []);
-      kick(node, tone === "save_memory" ? 8 : 4.5);
+      settleNearLinks(node);
+      kick(node, tone === "save_memory" ? 2.2 : 1.2);
       return node;
     }
 
-    async function applyEvent(event) {
+    function flyTo(x, y, z, distance) {
+      fly = {
+        x0: camera.targetX,
+        y0: camera.targetY,
+        z0: camera.targetZ,
+        d0: camera.distance,
+        x,
+        y,
+        z,
+        distance,
+        t: 0,
+      };
+    }
+
+    function flyToNode(node) {
+      if (!node || node.hx == null) return;
+      const span = 80 + Math.sqrt(node.groupSize || 1) * 42;
+      const { width, height } = viewSize();
+      const distance = Math.max(160, span * focalLength() / (Math.min(width, height) * 0.3));
+      flyTo(node.x, node.y, node.z, distance);
+    }
+
+    function stepFly() {
+      if (!fly) return;
+      fly.t += 0.05;
+      const ease = 1 - Math.pow(1 - Math.min(1, fly.t), 3);
+      camera.targetX = fly.x0 + (fly.x - fly.x0) * ease;
+      camera.targetY = fly.y0 + (fly.y - fly.y0) * ease;
+      camera.targetZ = fly.z0 + (fly.z - fly.z0) * ease;
+      camera.distance = fly.d0 + (fly.distance - fly.d0) * ease;
+      if (fly.t >= 1) fly = null;
+    }
+
+    async function applyEvent(event, options = {}) {
       const action = event.action || event.retrieval;
       const ids = event.memory_ids || [];
       hotUntil = performance.now() + 6000;
@@ -197,9 +267,7 @@
       for (const node of nodes) {
         if (!idSet.has(node.id)) continue;
         node.tone = "retrieve_memories";
-        kick(node, 4.5);
-        node.x += (canvas.clientWidth / 2 - node.x) * 0.08;
-        node.y += (canvas.clientHeight / 2 - node.y) * 0.08;
+        kick(node, 1.2);
       }
       for (const link of links) {
         if (idSet.has(link.source.id) || idSet.has(link.target.id)) {
@@ -211,23 +279,75 @@
         ? `retrieve_memories (${event.retrieval}): ${count} memories for “${queryLabel}”`
         : `retrieve_memories (${event.retrieval}): no memories for “${queryLabel}”`;
       const first = ids[0];
-      if (first) selectMemory(first);
+      if (first) {
+        selectMemory(first);
+        if (options.fly) flyToNode(byId.get(first));
+      }
     }
 
-    function screenToWorld(sx, sy) {
-      return { x: (sx - camera.x) / camera.k, y: (sy - camera.y) / camera.k };
+    function cameraBasis() {
+      const cp = Math.cos(camera.pitch);
+      const sp = Math.sin(camera.pitch);
+      const cy = Math.cos(camera.yaw);
+      const sy = Math.sin(camera.yaw);
+      const forward = { x: -cp * sy, y: -sp, z: -cp * cy };
+      let rx = -forward.z;
+      let ry = 0;
+      let rz = forward.x;
+      const rlen = Math.hypot(rx, ry, rz) || 1;
+      const right = { x: rx / rlen, y: ry / rlen, z: rz / rlen };
+      const up = {
+        x: right.y * forward.z - right.z * forward.y,
+        y: right.z * forward.x - right.x * forward.z,
+        z: right.x * forward.y - right.y * forward.x,
+      };
+      const cam = {
+        x: camera.targetX - forward.x * camera.distance,
+        y: camera.targetY - forward.y * camera.distance,
+        z: camera.targetZ - forward.z * camera.distance,
+      };
+      return { forward, right, up, cam };
     }
 
-    function hitNode(wx, wy) {
-      const reach = 10 / camera.k;
+    function projectNode(node, basis, focal, width, height) {
+      const ox = node.x - basis.cam.x;
+      const oy = node.y - basis.cam.y;
+      const oz = node.z - basis.cam.z;
+      const cx = ox * basis.right.x + oy * basis.right.y + oz * basis.right.z;
+      const cy = ox * basis.up.x + oy * basis.up.y + oz * basis.up.z;
+      const cz = ox * basis.forward.x + oy * basis.forward.y + oz * basis.forward.z;
+      node.cz = cz;
+      if (cz < 1) {
+        node.sx = -9999;
+        node.sy = -9999;
+        node.screenR = 0;
+        return;
+      }
+      const depthScale = camera.distance / cz;
+      node.sx = width / 2 + (cx * focal) / cz;
+      node.sy = height / 2 - (cy * focal) / cz;
+      node.depthScale = depthScale;
+      node.screenR = 3;
+    }
+
+    function unproject(sx, sy, cz, basis, focal, width, height) {
+      const cx = ((sx - width / 2) * cz) / focal;
+      const cy = -((sy - height / 2) * cz) / focal;
+      return {
+        x: basis.cam.x + basis.right.x * cx + basis.up.x * cy + basis.forward.x * cz,
+        y: basis.cam.y + basis.right.y * cx + basis.up.y * cy + basis.forward.y * cz,
+        z: basis.cam.z + basis.right.z * cx + basis.up.z * cy + basis.forward.z * cz,
+      };
+    }
+
+    function hitNode(sx, sy) {
       let best = null;
-      let bestDistance = reach;
       for (const node of nodes) {
-        const distance = Math.hypot(node.x - wx, node.y - wy);
-        if (distance <= bestDistance) {
-          best = node;
-          bestDistance = distance;
-        }
+        if (node.cz < 1 || node.screenR <= 0) continue;
+        const reach = Math.max(8, node.screenR + 4);
+        const distance = Math.hypot(node.sx - sx, node.sy - sy);
+        if (distance > reach) continue;
+        if (!best || node.cz < best.cz) best = node;
       }
       return best;
     }
@@ -253,112 +373,383 @@
       document.getElementById("detail-body").textContent = memory.content || "";
     }
 
-    async function poll() {
+    async function poll(options = {}) {
       const response = await fetch(`/events?after=${lastEventId}`);
       const payload = await response.json();
       for (const event of payload.events) {
         lastEventId = event.id;
-        await applyEvent(event);
+        await applyEvent(event, options);
       }
     }
 
-    function tick() {
-      const width = canvas.width / devicePixelRatio;
-      const height = canvas.height / devicePixelRatio;
-      const cx = width / 2;
-      const cy = height / 2;
-      const neighbors = 20;
-      for (let i = 0; i < nodes.length; i++) {
-        for (let k = 1; k <= neighbors; k++) {
-          const a = nodes[i];
-          const b = nodes[(i + k) % nodes.length];
-          let dx = a.x - b.x;
-          let dy = a.y - b.y;
-          let dist = Math.hypot(dx, dy) || 0.01;
-          const force = 120 / (dist * dist);
+    function linkWeight(link) {
+      return typeof link.weight === "number" ? link.weight : 0.5;
+    }
+
+    function restLength(weight) {
+      return 28 + (1 - weight) * 150;
+    }
+
+    function buildGroups() {
+      const parent = new Map();
+      const size = new Map();
+      for (const node of nodes) {
+        parent.set(node, node);
+        size.set(node, 1);
+      }
+      function find(node) {
+        let root = node;
+        while (parent.get(root) !== root) root = parent.get(root);
+        let current = node;
+        while (current !== root) {
+          const next = parent.get(current);
+          parent.set(current, root);
+          current = next;
+        }
+        return root;
+      }
+      const ranked = links.slice().sort((a, b) => linkWeight(b) - linkWeight(a));
+      for (const link of ranked) {
+        const weight = linkWeight(link);
+        if (weight < 0.62) break;
+        let left = find(link.source);
+        let right = find(link.target);
+        if (left === right) continue;
+        if (size.get(left) + size.get(right) > 16) continue;
+        if (size.get(left) < size.get(right)) [left, right] = [right, left];
+        parent.set(right, left);
+        size.set(left, size.get(left) + size.get(right));
+      }
+      const members = new Map();
+      for (const node of nodes) {
+        const root = find(node);
+        if (!members.has(root)) members.set(root, []);
+        members.get(root).push(node);
+      }
+      const groups = [];
+      const singles = [];
+      for (const group of members.values()) {
+        if (group.length === 1) singles.push(group[0]);
+        else groups.push(group);
+      }
+      const groupOf = new Map();
+      for (const group of groups) {
+        for (const node of group) groupOf.set(node, group);
+      }
+      for (const node of singles) {
+        let best = null;
+        for (const link of links) {
+          const other = link.source === node ? link.target : link.target === node ? link.source : null;
+          if (!other) continue;
+          const group = groupOf.get(other);
+          if (!group) continue;
+          const weight = linkWeight(link);
+          if (!best || weight > best.weight) best = { group, weight };
+        }
+        if (best && best.weight >= 0.62) best.group.push(node);
+        else groups.push([node]);
+      }
+      groups.forEach((group, index) => {
+        for (const node of group) {
+          node.group = index;
+          node.groupSize = group.length;
+        }
+      });
+      return groups;
+    }
+
+    function shellPoint(index, count, radius) {
+      if (count <= 1 || radius === 0) return { x: 0, y: 0, z: 0 };
+      const golden = Math.PI * (3 - Math.sqrt(5));
+      const y = 1 - (index / Math.max(count - 1, 1)) * 2;
+      const ring = Math.sqrt(Math.max(0, 1 - y * y));
+      const theta = golden * index;
+      return {
+        x: Math.cos(theta) * ring * radius,
+        y: y * radius,
+        z: Math.sin(theta) * ring * radius,
+      };
+    }
+
+    function arrangeGroups() {
+      const groups = buildGroups();
+      const count = groups.length;
+      const golden = Math.PI * (3 - Math.sqrt(5));
+      const spread = 90 + Math.cbrt(Math.max(count, 1)) * 170;
+      const centers = groups.map((group, index) => {
+        const t = count <= 1 ? 0 : index / (count - 1);
+        const y = 1 - t * 2;
+        const ring = Math.sqrt(Math.max(0, 1 - y * y));
+        const theta = golden * index;
+        const radius = group.length === 1 ? 0 : 24 + Math.sqrt(group.length) * 16;
+        return {
+          group,
+          x: Math.cos(theta) * ring * spread,
+          y: y * spread,
+          z: Math.sin(theta) * ring * spread,
+          vx: 0,
+          vy: 0,
+          vz: 0,
+          r: radius,
+        };
+      });
+      const bridges = [];
+      for (const link of links) {
+        const left = link.source.group;
+        const right = link.target.group;
+        if (left == null || right == null || left === right) continue;
+        bridges.push({ a: centers[left], b: centers[right], w: linkWeight(link) });
+      }
+      for (let step = 0; step < 80; step++) {
+        for (const center of centers) {
+          center.vx *= 0.7;
+          center.vy *= 0.7;
+          center.vz *= 0.7;
+        }
+        for (let i = 0; i < centers.length; i++) {
+          for (let j = i + 1; j < centers.length; j++) {
+            const a = centers[i];
+            const b = centers[j];
+            let dx = a.x - b.x;
+            let dy = a.y - b.y;
+            let dz = a.z - b.z;
+            const dist = Math.hypot(dx, dy, dz) || 0.5;
+            const need = a.r + b.r + 56;
+            const mag = dist < need ? (need - dist) * 0.08 : (need * need) / (dist * dist) * 0.35;
+            dx /= dist;
+            dy /= dist;
+            dz /= dist;
+            a.vx += dx * mag;
+            a.vy += dy * mag;
+            a.vz += dz * mag;
+            b.vx -= dx * mag;
+            b.vy -= dy * mag;
+            b.vz -= dz * mag;
+          }
+        }
+        for (const bridge of bridges) {
+          const a = bridge.a;
+          const b = bridge.b;
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          let dz = b.z - a.z;
+          const dist = Math.hypot(dx, dy, dz) || 0.5;
+          const rest = a.r + b.r + 70 + (1 - bridge.w) * 110;
+          const delta = (dist - rest) * 0.012 * bridge.w;
           dx /= dist;
           dy /= dist;
-          a.vx += dx * force;
-          a.vy += dy * force;
-          b.vx -= dx * force;
-          b.vy -= dy * force;
+          dz /= dist;
+          a.vx += dx * delta;
+          a.vy += dy * delta;
+          a.vz += dz * delta;
+          b.vx -= dx * delta;
+          b.vy -= dy * delta;
+          b.vz -= dz * delta;
+        }
+        for (const center of centers) {
+          const speed = Math.hypot(center.vx, center.vy, center.vz);
+          if (speed > 18) {
+            center.vx = (center.vx / speed) * 18;
+            center.vy = (center.vy / speed) * 18;
+            center.vz = (center.vz / speed) * 18;
+          }
+          center.x += center.vx;
+          center.y += center.vy;
+          center.z += center.vz;
         }
       }
-      for (const link of links) {
-        const a = link.source;
-        const b = link.target;
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        const dist = Math.hypot(dx, dy) || 0.01;
-        const delta = (dist - 70) * 0.004 * link.weight;
-        dx /= dist;
-        dy /= dist;
-        a.vx += dx * delta;
-        a.vy += dy * delta;
-        b.vx -= dx * delta;
-        b.vy -= dy * delta;
+      for (let pass = 0; pass < 48; pass++) {
+        for (let i = 0; i < centers.length; i++) {
+          for (let j = i + 1; j < centers.length; j++) {
+            const a = centers[i];
+            const b = centers[j];
+            let dx = a.x - b.x;
+            let dy = a.y - b.y;
+            let dz = a.z - b.z;
+            const dist = Math.hypot(dx, dy, dz) || 0.5;
+            const need = a.r + b.r + 42;
+            if (dist >= need) continue;
+            const push = (need - dist) / 2;
+            dx /= dist;
+            dy /= dist;
+            dz /= dist;
+            a.x += dx * push;
+            a.y += dy * push;
+            a.z += dz * push;
+            b.x -= dx * push;
+            b.y -= dy * push;
+            b.z -= dz * push;
+          }
+        }
       }
-      const now = performance.now();
-      for (const node of nodes) {
-        if (node.pinned) {
+      for (const center of centers) {
+        center.group.forEach((node, index) => {
+          const point = shellPoint(index, center.group.length, center.r);
+          node.x = center.x + point.x;
+          node.y = center.y + point.y;
+          node.z = center.z + point.z;
+          node.hx = node.x;
+          node.hy = node.y;
+          node.hz = node.z;
           node.vx = 0;
           node.vy = 0;
+          node.vz = 0;
+          node.fresh = false;
+        });
+      }
+      fitCamera();
+    }
+
+    function settleNearLinks(node) {
+      if (!node.fresh) return;
+      let best = null;
+      for (const link of links) {
+        const other = link.source === node ? link.target : link.target === node ? link.source : null;
+        if (!other) continue;
+        const weight = linkWeight(link);
+        if (!best || weight > best.weight) best = { other, weight };
+      }
+      node.fresh = false;
+      if (!best) return;
+      node.group = best.other.group;
+      node.groupSize = best.other.groupSize || 1;
+      const angle = ((node.id * 92821) % 360) * (Math.PI / 180);
+      const dist = restLength(best.weight);
+      const lift = ((node.id * 17) % 40) - 20;
+      node.x = best.other.x + Math.cos(angle) * dist;
+      node.y = best.other.y + Math.sin(angle) * dist;
+      node.z = (best.other.z || 0) + lift;
+      node.hx = node.x;
+      node.hy = node.y;
+      node.hz = node.z;
+    }
+
+    function fitCamera() {
+      fly = null;
+      if (!nodes.length) return;
+      let x = 0;
+      let y = 0;
+      let z = 0;
+      for (const node of nodes) {
+        x += node.x;
+        y += node.y;
+        z += node.z || 0;
+      }
+      x /= nodes.length;
+      y /= nodes.length;
+      z /= nodes.length;
+      let radius = 80;
+      for (const node of nodes) {
+        radius = Math.max(radius, Math.hypot(node.x - x, node.y - y, (node.z || 0) - z));
+      }
+      const { width, height } = viewSize();
+      camera.targetX = x;
+      camera.targetY = y;
+      camera.targetZ = z;
+      camera.yaw = 0.55;
+      camera.pitch = 0.34;
+      camera.distance = Math.min(8000, Math.max(220, (radius * focalLength()) / (Math.min(width, height) * 0.52)));
+    }
+
+    function holdHomes() {
+      for (const node of nodes) {
+        if (node.pinned || node.hx == null) {
+          node.vx = 0;
+          node.vy = 0;
+          node.vz = 0;
           continue;
         }
-        node.vx += (cx - node.x) * 0.0008;
-        node.vy += (cy - node.y) * 0.0008;
-        node.vx *= 0.86;
-        node.vy *= 0.86;
+        node.vx += (node.hx - node.x) * 0.05;
+        node.vy += (node.hy - node.y) * 0.05;
+        node.vz += (node.hz - node.z) * 0.05;
+        node.vx *= 0.72;
+        node.vy *= 0.72;
+        node.vz *= 0.72;
         node.x += node.vx;
         node.y += node.vy;
+        node.z += node.vz;
       }
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.setTransform(
-        devicePixelRatio * camera.k,
-        0,
-        0,
-        devicePixelRatio * camera.k,
-        devicePixelRatio * camera.x,
-        devicePixelRatio * camera.y,
-      );
-      for (const link of links) {
-        const hot = link.hot && link.hot > now;
-        const selected = link.source.id === selectedId || link.target.id === selectedId;
-        ctx.strokeStyle = hot || selected ? "#7aa2ff" : "#3a3a3a";
-        ctx.globalAlpha = hot || selected ? 0.9 : 0.35;
-        ctx.lineWidth = (hot || selected ? 1.6 : 0.6) / camera.k;
-        ctx.beginPath();
-        ctx.moveTo(link.source.x, link.source.y);
-        ctx.lineTo(link.target.x, link.target.y);
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
-      for (const node of nodes) {
-        const hot = node.hot && node.hot > now;
-        const selected = node.id === selectedId;
-        const neighbor = neighborIds.has(node.id);
-        const hovered = node.id === hoverId;
-        const toneColor = {
-          save_memory: "#7dcea0",
-          update_memory: "#f0c674",
-          retrieve_memories: "#7aa2ff",
-          backfill_embeddings: "#7dcea0",
-          reembed_embeddings: "#f0c674",
-        };
-        ctx.fillStyle = selected || hot
-          ? (toneColor[node.tone] || "#7aa2ff")
-          : neighbor ? "#c5d4ff" : "#8d8d8d";
-        ctx.beginPath();
-        ctx.arc(node.x, node.y, (selected || hot ? 7 : hovered ? 5 : 2.5) / camera.k, 0, Math.PI * 2);
-        ctx.fill();
-        if (selected || hot || hovered) {
-          ctx.fillStyle = "#e8e8e8";
-          ctx.font = `${11 / camera.k}px ui-sans-serif, system-ui, sans-serif`;
-          ctx.fillText(node.title || String(node.id), node.x + 8 / camera.k, node.y - 8 / camera.k);
+    }
+
+    function screenRadius(node, hot, selected, hovered) {
+      const base = selected || hot ? 7 : hovered ? 5.5 : 3.1;
+      const depthScale = node.depthScale || 1;
+      return Math.min(18, Math.max(1.7, base * depthScale));
+    }
+
+    function tick() {
+      const { width, height } = viewSize();
+      if (!userMoved && !drag && !fly) camera.yaw += 0.0011;
+      stepFly();
+      holdHomes();
+      const basis = cameraBasis();
+      const focal = focalLength();
+      for (const node of nodes) projectNode(node, basis, focal, width, height);
+      const now = performance.now();
+      hoverNeighborIds.clear();
+      if (hoverId != null) {
+        for (const link of links) {
+          if (link.source.id === hoverId) hoverNeighborIds.add(link.target.id);
+          if (link.target.id === hoverId) hoverNeighborIds.add(link.source.id);
         }
       }
+      const hoverNode = hoverId == null ? null : byId.get(hoverId);
+      const focusGroup = hoverNode ? hoverNode.group : null;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+      const visibleLinks = links.filter((link) => link.source.cz >= 1 && link.target.cz >= 1);
+      visibleLinks.sort((a, b) => (b.source.cz + b.target.cz) - (a.source.cz + a.target.cz));
+      for (const link of visibleLinks) {
+        const hot = link.hot && link.hot > now;
+        const selected = link.source.id === selectedId || link.target.id === selectedId;
+        const hovered = link.source.id === hoverId || link.target.id === hoverId;
+        const inFocus = focusGroup != null && link.source.group === focusGroup && link.target.group === focusGroup;
+        const depthScale = camera.distance / Math.max(1, (link.source.cz + link.target.cz) / 2);
+        const emphasized = hot || selected || hovered || inFocus;
+        ctx.strokeStyle = emphasized ? "#8eb0ff" : "#3a3a3a";
+        ctx.globalAlpha = emphasized ? 0.85 : focusGroup == null ? 0.28 : 0.08;
+        ctx.lineWidth = (emphasized ? 1.5 : 0.7) * Math.min(2.2, Math.max(0.35, depthScale));
+        ctx.beginPath();
+        ctx.moveTo(link.source.sx, link.source.sy);
+        ctx.lineTo(link.target.sx, link.target.sy);
+        ctx.stroke();
+      }
+      const drawNodes = nodes.filter((node) => node.cz >= 1);
+      drawNodes.sort((a, b) => b.cz - a.cz);
+      const toneColor = {
+        save_memory: "#7dcea0",
+        update_memory: "#f0c674",
+        retrieve_memories: "#7aa2ff",
+        backfill_embeddings: "#7dcea0",
+        reembed_embeddings: "#f0c674",
+      };
+      for (const node of drawNodes) {
+        const hot = node.hot && node.hot > now;
+        const selected = node.id === selectedId;
+        const neighbor = neighborIds.has(node.id) || hoverNeighborIds.has(node.id);
+        const hovered = node.id === hoverId;
+        const inFocus = focusGroup == null || node.group === focusGroup;
+        const grouped = node.groupSize > 1;
+        node.screenR = screenRadius(node, hot, selected, hovered);
+        ctx.globalAlpha = inFocus || selected || hot || hovered || neighbor ? 1 : 0.38;
+        ctx.fillStyle = selected || hot
+          ? (toneColor[node.tone] || "#7aa2ff")
+          : hovered ? "#f7f7f7"
+          : neighbor ? "#d5e2ff"
+          : grouped ? `hsl(${(node.group * 47) % 360} 42% ${inFocus ? 66 : 48}%)`
+          : "#8d8d8d";
+        ctx.beginPath();
+        ctx.arc(node.sx, node.sy, node.screenR, 0, Math.PI * 2);
+        ctx.fill();
+        if (selected || hot || hovered) {
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = "#e8e8e8";
+          ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
+          ctx.fillText(node.title || String(node.id), node.sx + node.screenR + 6, node.sy - node.screenR - 2);
+        }
+      }
+      ctx.globalAlpha = 1;
       if (hotUntil > now && queryLabel) {
         ctx.fillStyle = "#9a9a9a";
         ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
@@ -372,87 +763,162 @@
       return { x: event.clientX - rect.left, y: event.clientY - rect.top };
     }
 
+    canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+
     canvas.addEventListener("pointerdown", (event) => {
       const screen = pointerPosition(event);
-      const world = screenToWorld(screen.x, screen.y);
-      const node = hitNode(world.x, world.y);
+      const node = hitNode(screen.x, screen.y);
+      const pan = event.button === 1 || event.button === 2 || event.shiftKey;
+      userMoved = true;
+      fly = null;
       canvas.setPointerCapture(event.pointerId);
-      if (node) {
+      if (node && !pan) {
         node.pinned = true;
-        drag = { type: "node", node, dx: world.x - node.x, dy: world.y - node.y };
+        const { width, height } = viewSize();
+        const basis = cameraBasis();
+        const grabbed = unproject(screen.x, screen.y, node.cz, basis, focalLength(), width, height);
+        drag = {
+          type: "node",
+          node,
+          moved: false,
+          x: screen.x,
+          y: screen.y,
+          ox: node.x - grabbed.x,
+          oy: node.y - grabbed.y,
+          oz: node.z - grabbed.z,
+          cz: node.cz,
+        };
         selectMemory(node.id);
-      } else {
-        drag = { type: "pan", x: screen.x, y: screen.y, cx: camera.x, cy: camera.y };
+        canvas.style.cursor = "grabbing";
+        return;
       }
+      drag = {
+        type: pan ? "pan" : "orbit",
+        moved: false,
+        x: screen.x,
+        y: screen.y,
+        yaw: camera.yaw,
+        pitch: camera.pitch,
+        tx: camera.targetX,
+        ty: camera.targetY,
+        tz: camera.targetZ,
+      };
+      canvas.style.cursor = "grabbing";
     });
 
     canvas.addEventListener("pointermove", (event) => {
       const screen = pointerPosition(event);
-      const world = screenToWorld(screen.x, screen.y);
       if (!drag) {
-        const node = hitNode(world.x, world.y);
+        const node = hitNode(screen.x, screen.y);
         hoverId = node ? node.id : null;
         canvas.style.cursor = node ? "pointer" : "grab";
         return;
       }
+      if (Math.hypot(screen.x - drag.x, screen.y - drag.y) > 4) drag.moved = true;
       if (drag.type === "node") {
-        drag.node.x = world.x - drag.dx;
-        drag.node.y = world.y - drag.dy;
-        canvas.style.cursor = "grabbing";
+        const { width, height } = viewSize();
+        const basis = cameraBasis();
+        const grabbed = unproject(screen.x, screen.y, drag.cz, basis, focalLength(), width, height);
+        drag.node.x = grabbed.x + drag.ox;
+        drag.node.y = grabbed.y + drag.oy;
+        drag.node.z = grabbed.z + drag.oz;
         return;
       }
-      camera.x = drag.cx + (screen.x - drag.x);
-      camera.y = drag.cy + (screen.y - drag.y);
-      canvas.style.cursor = "grabbing";
+      if (drag.type === "orbit") {
+        camera.yaw = drag.yaw + (screen.x - drag.x) * 0.006;
+        camera.pitch = Math.max(-1.15, Math.min(1.15, drag.pitch + (screen.y - drag.y) * 0.005));
+        return;
+      }
+      const { width, height } = viewSize();
+      const basis = cameraBasis();
+      const scale = camera.distance / focalLength();
+      const dx = (screen.x - drag.x) * scale;
+      const dy = (screen.y - drag.y) * scale;
+      camera.targetX = drag.tx - basis.right.x * dx + basis.up.x * dy;
+      camera.targetY = drag.ty - basis.right.y * dx + basis.up.y * dy;
+      camera.targetZ = drag.tz - basis.right.z * dx + basis.up.z * dy;
     });
 
-    function endDrag() {
-      if (drag && drag.type === "node") drag.node.pinned = false;
+    function endDrag(event) {
+      if (!drag) return;
+      const screen = event ? pointerPosition(event) : { x: drag.x, y: drag.y };
+      if (drag.type === "node") {
+        drag.node.pinned = false;
+        drag.node.vx = 0;
+        drag.node.vy = 0;
+        drag.node.vz = 0;
+        if (drag.moved) {
+          drag.node.hx = drag.node.x;
+          drag.node.hy = drag.node.y;
+          drag.node.hz = drag.node.z;
+        }
+      }
+      const nodeId = drag.type === "node" ? drag.node.id : null;
+      const moved = drag.moved;
       drag = null;
       canvas.style.cursor = "grab";
+      if (moved) return;
+      const now = performance.now();
+      const sameSpot = Math.hypot(screen.x - lastClick.x, screen.y - lastClick.y) < 8;
+      if (now - lastClick.t < 320 && sameSpot && lastClick.id === nodeId) {
+        if (nodeId == null) fitCamera();
+        else flyToNode(byId.get(nodeId));
+      }
+      lastClick = { t: now, x: screen.x, y: screen.y, id: nodeId };
     }
     canvas.addEventListener("pointerup", endDrag);
-    canvas.addEventListener("pointercancel", endDrag);
+    canvas.addEventListener("pointercancel", () => endDrag(null));
 
     canvas.addEventListener("wheel", (event) => {
       event.preventDefault();
+      userMoved = true;
+      fly = null;
       const screen = pointerPosition(event);
-      const before = screenToWorld(screen.x, screen.y);
-      const factor = event.deltaY < 0 ? 1.08 : 0.92;
-      camera.k = Math.min(4, Math.max(0.35, camera.k * factor));
-      camera.x = screen.x - before.x * camera.k;
-      camera.y = screen.y - before.y * camera.k;
+      const { width, height } = viewSize();
+      const focal = focalLength();
+      const before = cameraBasis();
+      const anchor = unproject(screen.x, screen.y, camera.distance, before, focal, width, height);
+      const factor = event.deltaY < 0 ? 0.9 : 1.11;
+      camera.distance = Math.min(8000, Math.max(120, camera.distance * factor));
+      const after = cameraBasis();
+      const shifted = unproject(screen.x, screen.y, camera.distance, after, focal, width, height);
+      camera.targetX += anchor.x - shifted.x;
+      camera.targetY += anchor.y - shifted.y;
+      camera.targetZ += anchor.z - shifted.z;
     }, { passive: false });
+
+    async function warmLayout() {
+      arrangeGroups();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
 
     async function start() {
       resize();
       const graph = await (await fetch("/graph")).json();
-      const count = graph.nodes.length;
-      const radius = Math.min(canvas.clientWidth, canvas.clientHeight) * 0.38;
-      graph.nodes.forEach((node, index) => {
-        const angle = (index / Math.max(count, 1)) * Math.PI * 2;
-        const placed = {
-          ...node,
-          x: canvas.clientWidth / 2 + Math.cos(angle) * radius,
-          y: canvas.clientHeight / 2 + Math.sin(angle) * radius * 0.72,
-          vx: 0,
-          vy: 0,
-          hot: 0,
-        };
-        nodes.push(placed);
-        byId.set(node.id, placed);
-      });
+      for (const node of graph.nodes) {
+        const placed = addNode(node.id, node.title);
+        placed.fresh = true;
+        placed.x = 0;
+        placed.y = 0;
+        placed.z = 0;
+      }
       for (const link of graph.links) {
         const source = byId.get(link.source);
         const target = byId.get(link.target);
         if (source && target) links.push({ source, target, weight: link.weight, hot: 0 });
       }
-      statusEl.textContent = `${nodes.length} memories, ${links.length} similarity links.`;
       const existing = await (await fetch("/events?after=0")).json();
-      if (existing.events.length) {
+      const hadEvent = existing.events.length > 0;
+      if (hadEvent) {
         lastEventId = existing.events[existing.events.length - 1].id - 1;
-        applyEvent(existing.events[existing.events.length - 1]);
+        await applyEvent(existing.events[existing.events.length - 1]);
       }
+      const eventStatus = statusEl.textContent;
+      statusEl.textContent = `Grouping ${nodes.length} memories…`;
+      await warmLayout();
+      statusEl.textContent = hadEvent
+        ? eventStatus
+        : `${nodes.length} memories, ${links.length} similarity links.`;
       setInterval(() => { poll().catch(() => {}); }, 1000);
       requestAnimationFrame(tick);
     }
@@ -466,7 +932,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query }),
       });
-      await poll();
+      await poll({ fly: true });
     });
 
     start();
